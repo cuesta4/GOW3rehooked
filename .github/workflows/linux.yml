@@ -1,0 +1,111 @@
+# DRAFT (Phase 0 of the Linux port): manual only until the Linux build links. Not published.
+name: Linux
+
+on:
+  workflow_dispatch:
+  # Later: push tags ['v*'] together with windows.yml, and pull_request for a compile-only check.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux x86_64 (O3, full LTO)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      LLVM_VERSION: 22.1.8
+      VCPKG_ROOT: ${{ github.workspace }}/build-linux/vcpkg
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/build-linux/.cache/vcpkg-binaries
+      SCCACHE_DIR: ${{ github.workspace }}/build-linux/.cache/sccache
+      SCCACHE_CACHE_SIZE: 2G
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the system packages SDL3, FFmpeg's NASM sources and the build need
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build nasm pkg-config libstdc++-14-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxtst-dev \
+            libwayland-dev libxkbcommon-dev libdecor-0-dev libegl-dev libgl-dev libdrm-dev libgbm-dev \
+            libpipewire-0.3-dev libpulse-dev libasound2-dev libudev-dev libdbus-1-dev libusb-1.0-0-dev
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0 (same pin as windows.yml's restore/save)
+        id: llvm
+        with:
+          path: ${{ runner.temp }}/llvm
+          key: llvm-${{ env.LLVM_VERSION }}-linux-x64
+      - name: Install LLVM 22.1.8 (the Windows CI's version) and sccache
+        run: |
+          set -euo pipefail
+          if [ ! -x "$RUNNER_TEMP/llvm/bin/clang" ]; then
+            curl -fsSL -o "$RUNNER_TEMP/llvm.tar.xz" "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/LLVM-$LLVM_VERSION-Linux-X64.tar.xz"
+            echo "df0e1ecf16caf3489a272a5eea4eec9b0d82878f6477fa309504f918a0006384  $RUNNER_TEMP/llvm.tar.xz" | sha256sum -c -
+            mkdir -p "$RUNNER_TEMP/llvm" && tar -xf "$RUNNER_TEMP/llvm.tar.xz" -C "$RUNNER_TEMP/llvm" --strip-components 1
+            rm "$RUNNER_TEMP/llvm.tar.xz"
+          fi
+          curl -fsSL -o "$RUNNER_TEMP/sccache.tar.gz" https://github.com/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-x86_64-unknown-linux-musl.tar.gz
+          echo "aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd  $RUNNER_TEMP/sccache.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/sccache" && tar -xf "$RUNNER_TEMP/sccache.tar.gz" -C "$RUNNER_TEMP/sccache" --strip-components 1
+          echo "$RUNNER_TEMP/llvm/bin" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/sccache" >> "$GITHUB_PATH"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: microsoft/vcpkg
+          ref: 3d22b64585ca026e881728fd87e541c23a611a43 # the windows.yml pin: same shaderc/glslang/SPIRV-Tools/Vulkan headers
+          path: build-linux/vcpkg
+          persist-credentials: false
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: cache
+        with:
+          path: |
+            build-linux/.cache/sccache
+            build-linux/.cache/vcpkg-binaries
+          key: ubuntu2404-clang22-o3-${{ hashFiles('build-linux.sh', 'CMakePresets.json', '.github/workflows/linux.yml') }}-${{ github.sha }}
+          restore-keys: |
+            ubuntu2404-clang22-o3-${{ hashFiles('build-linux.sh', 'CMakePresets.json', '.github/workflows/linux.yml') }}-
+            ubuntu2404-clang22-o3-
+      - name: Restore static shaderc and the Vulkan headers/loader (build on cache miss)
+        id: dependencies
+        run: |
+          set -euo pipefail
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+          "$VCPKG_ROOT/vcpkg" install shaderc:x64-linux vulkan-headers:x64-linux vulkan-loader:x64-linux
+          echo "GOW3_SHADERC_PREFIX=$VCPKG_ROOT/installed/x64-linux" >> "$GITHUB_ENV"
+      - name: Build Linux Release with O3 and full LTO
+        env:
+          VULKAN_SDK: ${{ github.workspace }}/build-linux/vcpkg/installed/x64-linux
+        run: |
+          ./build-linux.sh --ci --no-deploy
+          commands=build-linux/linux-ci/compile_commands.json
+          grep -q -- '-flto=full' "$commands" && grep -q -- '-O3' "$commands" && ! grep -q -- '-flto=thin' "$commands" &&
+            grep -q -- '--lto-O3' build-linux/linux-ci/build.ninja || { echo 'Expected O3 and full LTO with LTO O3'; exit 1; }
+      - name: Package both Linux executables with the licenses and the shader recipes
+        run: |
+          set -euo pipefail
+          package=build/package-linux
+          mkdir -p "$package/licenses" "$package/_rehooked_/shader_cache"
+          install -m 755 build/linux/gow3 build/linux/gow3_debug "$package/"
+          cp licenses/* "$package/licenses/"
+          cp assets/shader_cache/recipes-hash2-aes.bin "$package/_rehooked_/shader_cache/"
+          # TODO: THIRD-PARTY-NOTICES.txt as in windows.yml (same component list; shaderc/glslang/SPIRV-* from vcpkg's share/).
+          tar -C "$package" -cJf build/GOW3rehooked-Linux-x86_64.tar.xz .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: build/GOW3rehooked-Linux-x86_64.tar.xz
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+      - name: Save compiler and dependency caches
+        if: always() && steps.dependencies.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            build-linux/.cache/sccache
+            build-linux/.cache/vcpkg-binaries
+          key: ${{ steps.cache.outputs.cache-primary-key }}
