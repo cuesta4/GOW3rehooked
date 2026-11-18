@@ -162,8 +162,22 @@ add_library(ffmpeg STATIC
     libswresample/x86/resample.asm
 )
 target_include_directories(ffmpeg SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(WIN32)
 target_compile_definitions(ffmpeg PRIVATE $<$<COMPILE_LANGUAGE:C>:HAVE_AV_CONFIG_H;_ISOC11_SOURCE;_FILE_OFFSET_BITS=64;_LARGEFILE_SOURCE;_USE_MATH_DEFINES;_CRT_NONSTDC_NO_WARNINGS;_WIN32_WINNT=0x0600;PIC>)
 # FFmpeg relies on the optimizer dropping calls under disabled ARCH_*/HAVE_* checks; no LTO (inline asm names symbols).
 target_compile_options(ffmpeg PRIVATE $<$<COMPILE_LANGUAGE:C>:/clang:-march=${GOW3_CPU_ARCH};/std:c17;-w>
     $<$<COMPILE_LANGUAGE:ASM_NASM>:-I${CMAKE_CURRENT_SOURCE_DIR}/;-I${CMAKE_CURRENT_SOURCE_DIR}/libavutil/x86/;-P${CMAKE_CURRENT_SOURCE_DIR}/config.asm>)
 target_link_libraries(ffmpeg PUBLIC bcrypt)
+else()
+# Linux: linux/config.h and linux/config.asm come from the same configure options with --target-os=linux --enable-pthreads
+# (config_components.* are identical). They are searched before the Windows ones; -fno-strict-aliasing and -fms-volatile
+# keep the clang-cl semantics.
+target_include_directories(ffmpeg BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/linux)
+# The POSIX side of av_random_bytes (/dev/urandom) also needs avpriv_fopen_utf8; Windows uses BCrypt instead.
+target_sources(ffmpeg PRIVATE libavutil/file_open.c)
+target_compile_definitions(ffmpeg PRIVATE $<$<COMPILE_LANGUAGE:C>:HAVE_AV_CONFIG_H;_ISOC11_SOURCE;_FILE_OFFSET_BITS=64;_LARGEFILE_SOURCE;_POSIX_C_SOURCE=200112;_XOPEN_SOURCE=600;PIC>)
+target_compile_options(ffmpeg PRIVATE $<$<COMPILE_LANGUAGE:C>:-march=${GOW3_CPU_ARCH};-std=c17;-fno-strict-aliasing;-fms-volatile;-w>
+    $<$<COMPILE_LANGUAGE:ASM_NASM>:-I${CMAKE_CURRENT_SOURCE_DIR}/;-I${CMAKE_CURRENT_SOURCE_DIR}/libavutil/x86/;-P${CMAKE_CURRENT_SOURCE_DIR}/linux/config.asm>)
+find_package(Threads REQUIRED)
+target_link_libraries(ffmpeg PUBLIC Threads::Threads m)
+endif()
