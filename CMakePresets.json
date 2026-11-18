@@ -1,0 +1,101 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": { "CMAKE_EXPORT_COMPILE_COMMANDS": "ON" }
+    },
+    {
+      "name": "windows-release",
+      "displayName": "Windows Release (clang-cl, ThinLTO)",
+      "description": "The flags of build-fast.ps1 -Release. Run it from the EWDK/Developer shell that build-fast.ps1 sets up, with CMAKE_PREFIX_PATH pointing at the x64-gow3-static vcpkg tree.",
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-fast/windows-release",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_LINKER": "lld-link",
+        "CMAKE_AR": "llvm-lib",
+        "CMAKE_MT": "llvm-mt",
+        "CMAKE_CXX_FLAGS": "/utf-8",
+        "CMAKE_CXX_FLAGS_RELEASE": "/O2 /Ob2 /DNDEBUG",
+        "CMAKE_C_FLAGS_RELEASE": "/O2 /Ob2 /DNDEBUG"
+      }
+    },
+    {
+      "name": "linux-base",
+      "hidden": true,
+      "inherits": "base",
+      "binaryDir": "${sourceDir}/build-linux/${presetName}",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    },
+    {
+      "name": "linux-release",
+      "displayName": "Linux Release (clang, -O3, ThinLTO)",
+      "description": "clang-cl /O2 is -O3: the same optimization as the Windows build. ThinLTO with the lld cache.",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG",
+        "CMAKE_C_FLAGS_RELEASE": "-O3 -DNDEBUG",
+        "GOW3_LTO": "thin"
+      }
+    },
+    {
+      "name": "linux-relwithdebinfo",
+      "displayName": "Linux RelWithDebInfo (the default of build-fast.ps1)",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O3 -g -DNDEBUG",
+        "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O3 -g -DNDEBUG",
+        "GOW3_LTO": "thin"
+      }
+    },
+    {
+      "name": "linux-ci",
+      "displayName": "Linux CI (full LTO, LTO -O3, like windows.yml)",
+      "inherits": "linux-release",
+      "cacheVariables": {
+        "GOW3_LTO": "full",
+        "CMAKE_EXE_LINKER_FLAGS_RELEASE": "-Wl,--lto-O3"
+      }
+    },
+    {
+      "name": "linux-debug",
+      "displayName": "Linux Debug (-O0 -g, no LTO)",
+      "inherits": "linux-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_FLAGS_DEBUG": "-O0 -g",
+        "CMAKE_C_FLAGS_DEBUG": "-O0 -g",
+        "GOW3_LTO": "off",
+        "GOW3_ASAN": "OFF"
+      }
+    },
+    {
+      "name": "linux-debug-asan",
+      "displayName": "Linux Debug + AddressSanitizer",
+      "description": "The guest memory reservations of the runtime may need ASAN_OPTIONS (e.g. detect_leaks=0); see 02-build-linux.md.",
+      "inherits": "linux-debug",
+      "cacheVariables": { "CMAKE_CXX_FLAGS_DEBUG": "-O1 -g", "CMAKE_C_FLAGS_DEBUG": "-O1 -g", "GOW3_ASAN": "ON" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "windows-release", "configurePreset": "windows-release", "targets": ["gow3", "gow3_debug"] },
+    { "name": "linux-release", "configurePreset": "linux-release", "targets": ["gow3", "gow3_debug"] },
+    { "name": "linux-relwithdebinfo", "configurePreset": "linux-relwithdebinfo", "targets": ["gow3", "gow3_debug"] },
+    { "name": "linux-ci", "configurePreset": "linux-ci", "targets": ["gow3", "gow3_debug"] },
+    { "name": "linux-debug", "configurePreset": "linux-debug", "targets": ["gow3", "gow3_debug"] },
+    { "name": "linux-debug-asan", "configurePreset": "linux-debug-asan", "targets": ["gow3", "gow3_debug"] }
+  ]
+}
