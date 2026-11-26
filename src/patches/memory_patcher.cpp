@@ -106,7 +106,7 @@ void ApplyGamePatches(Core::Module& eboot, const Config& config) {
             value(site.rva, (site.height ? 1080 : 1920) / divisor, u32(site.height ? resolution.height : resolution.width) / divisor, site.size);
         }
     }
-    value(0x3cd918, 0x50000000, resolution.arena << 24);
+    value(0x3cd918, 0x50000000, VideoArenaHighByte(config) << 24);
     if (config.msaa != 2) value(0x3cdcd0, 1, std::countr_zero(config.msaa));
     if (config.fps != 60) { // Keep swing normalization at the original 59.94 Hz for every other rate.
         patches.push_back({0x08ff0a, {0x48, 0x8d, 0x05, 0x6f, 0xdd, 0x33, 0x00}, {0x48, 0x8d, 0x05, 0xf3, 0xdd, 0x2c, 0x00}});

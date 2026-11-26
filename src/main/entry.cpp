@@ -148,9 +148,10 @@ int Gow3Run(const Gow3PathChar* executable_directory, const Gow3PathChar* game_d
         for (size_t i = 0; i < paths.size(); ++i) Common::FS::SetUserPath(static_cast<Common::FS::PathType>(i), app / paths[i]);
         EmulatorSettings.SetSysModulesDir(app / home / "sys_modules");
         EmulatorSettings.SetHomeDir(app / home);
-        EmulatorSettings.SetExtraDmemInMBytes(Resolutions[config.resolution].dmem_mb); // Video Arena enlarged by the patches (1:1 over base)
+        const unsigned arena = VideoArenaHighByte(config);
+        EmulatorSettings.SetExtraDmemInMBytes(CalculateExtraDmemMb(arena)); // Video Arena enlarged by the patches (1:1 over base)
         if (DebugEnabled()) Log(std::format("Video Arena 1:1 DMEM alignment: extra {} MiB allocated (Base 1280 MiB -> Total Arena {} MiB)",
-                        Resolutions[config.resolution].dmem_mb, Resolutions[config.resolution].arena * 16));
+                        CalculateExtraDmemMb(arena), arena * 16));
         EmulatorSettings.SetVblankFrequency(config.fps); // nominal selection; VideoOut uses FramePeriodNs
         Common::ElfInfo::Instance().Initialize(game);
         if (flags == 0) {

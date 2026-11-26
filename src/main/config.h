@@ -88,6 +88,14 @@ struct Config {
     bool remove_motion_blur = false;
     bool remove_dof_spartan = false;
 };
+// MSAA above the game's 2x grows its two color targets and its depth/stencil (4 + 4 + 4 + 1 bytes a sample) inside the
+// Video Arena, and the texture heap (the arena's largest free block - 256 MiB) loses them: at 2160p 4x it fell to 768 MiB
+// and streaming overflowed it, so failed allocations left textures sharing one block (#97). Those bytes go back here.
+inline constexpr unsigned VideoArenaHighByte(const Config& c) {
+    const Resolution& r = Resolutions[c.resolution];
+    const unsigned long long msaa = c.msaa > 2 ? 13ull * r.width * r.height * (c.msaa - 2) : 0;
+    return r.arena + unsigned((msaa + (16ull << 20) - 1) >> 24);
+}
 Config LoadConfig(const std::filesystem::path& path);
 void SaveMenuConfig(const std::filesystem::path& path, const Config& config);
 void SaveExtrasConfig(const std::filesystem::path& path, const Config& config);
