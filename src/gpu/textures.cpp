@@ -2629,7 +2629,10 @@ u32 Renderer::Impl::Texture(const u32* t, const Gcn::SlotSpec& spec, bool storag
         stores.push_back({&g, std::min<u32>(t[3] >> 12 & 0xF, g.img_levels - 1)});
     static constexpr VkImageViewType vt[]{VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D_ARRAY, VK_IMAGE_VIEW_TYPE_3D, VK_IMAGE_VIEW_TYPE_CUBE};
     if (kind > 3 || (kind == 2) != g.volume || (kind == 3 && g.layers < 6)) return tex_keep = false, Note(std::format("T# view kind {} on its image", kind)), 0;
-    const u32 base_level = std::min<u32>(t[3] >> 12 & 0xF, g.img_levels - 1), base_array = std::min<u32>(t[5] & 0x1FFF, g.layers - 1);
+    const u32 base_level = std::min<u32>(t[3] >> 12 & 0xF, g.img_levels - 1);
+    const u32 raw_base_array = std::min<u32>(t[5] & 0x1FFF, g.layers - 1);
+    const u32 base_array = kind == 2 ? 0u : kind == 3 ? std::min(raw_base_array, g.layers - 6) : raw_base_array;
+    const u32 layer_count = kind == 0 || kind == 2 ? 1u : kind == 3 ? 6u : g.layers - base_array;
     const VkComponentMapping map = storage ? VkComponentMapping{} : g.map;
     // The T#s of one surface image share its views; a shorter one is its top-left part (`sub` below, bounded in the
     // shader). GOW3's grab passes copy each effect's screen rectangle through a T# as tall as the rectangle's bottom edge
@@ -2639,7 +2642,7 @@ u32 Renderer::Impl::Texture(const u32* t, const Gcn::SlotSpec& spec, bool storag
     auto v = views.find(vk);
     if (v == views.end()) {
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, base_level, storage ? 1 : g.img_levels - base_level,
-                                            kind == 0 ? base_array : 0, kind == 0 ? 1 : kind == 3 ? g.layers / 6 * 6 : g.layers};
+                                            base_array, layer_count};
         const VkImageView view = View(g.t.img, vt[kind], g.fmt, range, map, g.t.usage);
         if (!view) return tex_keep = false, 0;
         const u32 el = Bindless(binding, view, VK_NULL_HANDLE);
