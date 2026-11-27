@@ -89,13 +89,11 @@ struct ShaderCache::Dict {
     std::vector<std::uint8_t> samples;
     std::vector<std::size_t> sizes;
     ZSTD_CDict* c = nullptr;
-    std::atomic<ZSTD_DDict*> d{nullptr};
-    std::atomic<std::uint32_t> id{0};
-    ~Dict() { ZSTD_freeCDict(c), ZSTD_freeDDict(d.load(std::memory_order_relaxed)); }
+    ZSTD_DDict* d = nullptr;
+    std::uint32_t id = 0;
+    ~Dict() { ZSTD_freeCDict(c), ZSTD_freeDDict(d); }
     void Load(const void* blob, std::size_t size) {
-        c = ZSTD_createCDict(blob, size, kLevel);
-        d.store(ZSTD_createDDict(blob, size), std::memory_order_relaxed);
-        id.store(ZDICT_getDictID(blob, size), std::memory_order_release);
+        c = ZSTD_createCDict(blob, size, kLevel), d = ZSTD_createDDict(blob, size), id = ZDICT_getDictID(blob, size);
         samples = {}, sizes = {};
     }
     void Sample(const void* data, std::size_t size) {
@@ -159,7 +157,7 @@ void ShaderCache::Configure(const std::filesystem::path& d, CacheKind k) {
     }
     if (!valid) {
         view.reset();
-        locs[0].clear(), locs[1].clear(), writing[0].clear(), writing[1].clear(), index.clear(), glsl_map.clear(), wad_keys.clear();
+        locs[0].clear(), locs[1].clear(), index.clear(), glsl_map.clear(), wad_keys.clear();
         for (auto& dict : dicts) dict = std::make_unique<Dict>();
     }
     out.open(file, std::ios::binary | (valid ? std::ios::app : std::ios::trunc));
@@ -246,16 +244,11 @@ std::vector<std::uint8_t> ShaderCache::Decode(std::uint32_t type, const Loc& loc
     const std::uint8_t* src = v->data + loc.offset;
     const Dict& dict = *dicts[type];
     const std::uint32_t id = ZSTD_getDictID_fromFrame(src, loc.packed);
-    ZSTD_DDict* ddict = nullptr;
-    if (id) {
-        if (id != dict.id.load(std::memory_order_acquire)) return {};
-        ddict = dict.d.load(std::memory_order_relaxed);
-        if (!ddict) return {};
-    }
+    if (id && id != dict.id) return {};
     std::vector<std::uint8_t> raw(loc.raw);
     thread_local const std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> context{ZSTD_createDCtx(), ZSTD_freeDCtx};
-    const std::size_t n = ddict ? ZSTD_decompress_usingDDict(context.get(), raw.data(), raw.size(), src, loc.packed, ddict)
-                                : ZSTD_decompressDCtx(context.get(), raw.data(), raw.size(), src, loc.packed);
+    const std::size_t n = id ? ZSTD_decompress_usingDDict(context.get(), raw.data(), raw.size(), src, loc.packed, dict.d)
+                             : ZSTD_decompressDCtx(context.get(), raw.data(), raw.size(), src, loc.packed);
     return ZSTD_isError(n) || n != raw.size() ? std::vector<std::uint8_t>{} : raw;
 }
 
@@ -344,7 +337,7 @@ bool ShaderCache::Append(std::uint32_t type, std::uint32_t stage, std::uint64_t 
     }
     const std::uint64_t at = file_end + sizeof(Entry);
     Put(type, stage, key, out_mask, std::uint32_t(bytes), packed.data(), std::uint32_t(n));
-    if (type < 2) locs[type][key] = {at, out_mask, std::uint32_t(n), std::uint32_t(bytes), stage}, writing[type].erase(key);
+    if (type < 2) locs[type][key] = {at, out_mask, std::uint32_t(n), std::uint32_t(bytes), stage};
     return true;
 }
 
@@ -370,12 +363,12 @@ std::uint64_t ShaderCache::Commit(std::uint64_t key, std::uint32_t stage, std::u
     bool write;
     {
         std::unique_lock l(lock);
-        write = !locs[0].contains(content) && writing[0].insert(content).second;
+        write = locs[0].try_emplace(content).second;  // reserved: concurrent stores of the content stop here, Append fills it in
         if (keep) shaders.try_emplace(content, keep);
     }
     if (write && !Append(kShader, stage, content, out_mask, spirv.data(), spirv.size() * 4)) {
         std::unique_lock l(lock);
-        writing[0].erase(content), shaders.erase(content);
+        locs[0].erase(content), shaders.erase(content);
         return 0;
     }
     Link(key, content);
@@ -415,11 +408,12 @@ bool ShaderCache::StoreBinary(std::uint64_t key, std::uint64_t out_mask, std::sp
     if (!enabled) return false;
     {
         std::unique_lock l(lock);
-        if (locs[1].contains(key) || !writing[1].insert(key).second) return false;
+        if (locs[1].contains(key)) return false;
+        locs[1][key] = {};
     }
     if (Append(kBinary, 0, key, out_mask, data.data(), data.size())) return true;
     std::unique_lock l(lock);
-    writing[1].erase(key);
+    locs[1].erase(key);
     return false;
 }
 

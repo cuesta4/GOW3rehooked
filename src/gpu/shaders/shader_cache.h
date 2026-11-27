@@ -146,7 +146,6 @@ private:
     mutable std::shared_mutex lock;
     std::unordered_map<std::uint64_t, std::shared_ptr<const CachedShader>> shaders;   // decoded, by content
     std::unordered_map<std::uint64_t, Loc> locs[2];  // records of the file (shaders by content, binaries)
-    std::unordered_set<std::uint64_t> writing[2];    // keys currently being compressed/appended (under lock)
     std::unordered_map<std::uint64_t, std::uint64_t> index, glsl_map;  // key -> content, GLSL hash -> content
     std::vector<Pair> index_new, glsl_new;                              // links not written yet (written in batches)
     std::unordered_map<std::uint64_t, std::shared_ptr<const CachedShader>> recent;  // recorded by the JIT, not written yet, by key

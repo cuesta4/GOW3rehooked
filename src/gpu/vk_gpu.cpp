@@ -467,8 +467,6 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
                                           F(ctx[0x107]), F(ctx[0x108]), ctx[0x2DC],
                                           (u64)(sh[0x48] | (u64)sh[0x49] << 32) << 8, (u64)(sh[0x08] | (u64)sh[0x09] << 32) << 8));
     if (draw_seq++ > stats.stop) return;
-    draw_vs_addr = (u64)(sh[0x48] | (u64)sh[0x49] << 32) << 8;
-    draw_ps_addr = (u64)(sh[0x08] | (u64)sh[0x09] << 32) << 8;
     draw_rts.clear();
     if (mode > 1) return Count(stats.skipped), Note(std::format("CB_COLOR_CONTROL mode {} skipped", mode));
     const bool rect = prim == 0x11, rect_vs = RectVs(op, b, cpu);
@@ -537,7 +535,7 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
     if (rw == ~0u) return Count(stats.skipped), Note("draw without attachments skipped");
 
     // Restrict early tests to shaders without guest side effects, depth exports or dynamic discard.
-    const u64 ps_addr = draw_ps_addr;
+    const u64 ps_addr = (u64)(sh[0x08] | (u64)sh[0x09] << 32) << 8;
     const u32 bc0 = ctx[0x1E0], info0 = ctx[0x31C], mask0 = color[0] ? AmdGpu::MrtSwizzle(info0 >> 11 & 3, AmdGpu::DataFormat(info0 >> 2 & 0x1F)).ApplyMask(target_mask & 15) : 0;
     const bool sep0 = bc0 >> 29 & 1;
     const u32 as0 = sep0 ? bc0 >> 16 & 31 : bc0 & 31, af0 = sep0 ? bc0 >> 21 & 7 : bc0 >> 5 & 7, ad0 = sep0 ? bc0 >> 24 & 31 : bc0 >> 8 & 31;
@@ -1255,7 +1253,11 @@ void Renderer::Impl::RecordBlocks(u32 rec) {
 #endif
             if (cpu < 64) p.cpu_mask |= 1ull << cpu;
         }
-        if (!own_writes.empty()) b.writes = std::move(own_writes), own_writes.clear();
+        if (!own_writes.empty()) {
+            std::scoped_lock lock(note_lock);
+            block_writes.insert(block_writes.end(), own_writes.begin(), own_writes.end());
+            own_writes.clear();
+        }
     }
     AddCounts();
     in_worker = false, synced_here = nullptr, horizon = ~size_t(0);
@@ -1526,12 +1528,6 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
                     return true;
             return false;
         };
-        auto storage_draw = [&] {
-            if (!r.has_storage_draw_progs.load(std::memory_order_relaxed)) return false;
-            const u64 vs_a = (u64)(r.sh[0x48] | (u64)r.sh[0x49] << 32) << 8;
-            const u64 ps_a = (u64)(r.sh[0x08] | (u64)r.sh[0x09] << 32) << 8;
-            return r.storage_draw_progs.contains(ps_a ^ (vs_a * 0x9E3779B97F4A7C15ull));
-        };
         r.Walk(chain, {0, 0}, end, [&](u32 op, const u32* b, size_t si, size_t i) {
             if (Impl::Effect(op)) return r.Collect(op, b);
             const bool draw = op == 0x27 || op == 0x2D || op == 0x35;
@@ -1545,7 +1541,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
             if (op == 0x46 && r.MeshDump(b)) return r.MeshQuery(b, !r.blocks.empty() && r.blocks.back().serial);
             if (!draw && op != 0x15 && !query) return;
             const auto copy = draw ? r.CopyRange() : std::pair<u32, u32>{};  // a predicated draw's queries, before it
-            if (op == 0x15 || query || r.query_open || linear() || storage_draw()) {
+            if (op == 0x15 || query || r.query_open || linear()) {
                 if (r.blocks.empty() || !r.blocks.back().serial) open({si, i}, true);
                 if (copy.second) r.CopyQueries(copy);
                 r.walk_seg = si, r.walk_pos = i;
@@ -1638,8 +1634,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
         }
         execute();
         Impl::Barrier(r.primary);  // the next frame starts after this one (its prologue fences only its own uploads)
-        for (auto& b : r.blocks)
-            if (!b.writes.empty()) r.gpu_writes.insert(r.gpu_writes.end(), b.writes.begin(), b.writes.end());
+        r.gpu_writes.insert(r.gpu_writes.end(), r.block_writes.begin(), r.block_writes.end()), r.block_writes.clear();
     }
     r.FlushLinearSyncs();
     for (auto& [op, u] : unhandled)  // once per opcode (first frame that has it)
