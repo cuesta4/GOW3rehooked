@@ -263,10 +263,15 @@ void Renderer::Impl::BindPages(u64 lo, u64 hi) {
         if (word & bit) continue;
         word |= bit;
         if (chunk_used + page > chunk_size) {
-            const VkMemoryRequirements req{chunk_size, page, mirror_bits};
-            const VkDeviceMemory m = Alloc(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
-            if (!m) {
+            VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags, chunk_size, DeviceType(mirror_bits, chunk_size)};
+            VkDeviceMemory m = VK_NULL_HANDLE;
+            if (const VkResult e = vkAllocateMemory(dev, &ai, nullptr, &m); e != VK_SUCCESS) {
                 word &= ~bit;  // the rest stays without memory (reads zero); the next write there tries again
+                alloc_pressure.store(true, std::memory_order_relaxed);
+                if (!chunk_failed)
+                    chunk_failed = true, Gow3::Log(std::format("Renderer: vkAllocateMemory {} for the guest mirror (type {}, {} MB held)", (int)e,
+                                                               (int)ai.memoryTypeIndex, mirror_chunks.load() >> 20));
                 break;
             }
             chunks.push_back(m), chunk_used = 0, mirror_chunks += chunk_size;
@@ -656,7 +661,6 @@ void Renderer::Impl::TrimFrameBuffers() {
 #include <cstring>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
@@ -692,8 +696,7 @@ const std::unique_ptr<std::atomic<u64>[]> dirty_groups(new std::atomic<u64>[kPag
 std::vector<u64> closed;                      // pages the last frame protected again from `dirty`, sorted (GPU thread)
 struct Live { u64 page; u32 quiet; };         // quiet: frames since its bytes last changed
 std::vector<Live> dynamic;                    // pages offered every frame (GPU thread)
-std::atomic<u32> generation{1};               // bumped on every mapping change
-std::shared_mutex map_lock;                   // Forget (exclusive) vs Readable slow path (shared)
+std::atomic<u32> generation{1};               // bumped on every mapping change: a query racing it may report the old one
 
 Kind KindOf(u64 page) { return Kind(state[page].load(std::memory_order_acquire) & 7); }
 #ifdef _WIN32
@@ -878,7 +881,6 @@ void Protect(const std::vector<u64>& pages) {
 
 // A guest mapping or protection change: the pages are tracked and queried again.
 void Forget(u64 addr, u64 size) {
-    std::unique_lock l(map_lock);
     const u64 p0 = addr / kPage, p1 = std::min((addr + size + kPage - 1) / kPage, kPages);
     for (u64 p = p0; p < p1; ++p)
         if (KindOf(p) != Region) state[p].store(Unknown, std::memory_order_release);
@@ -1101,9 +1103,7 @@ u64 CopyBacking(u64 dst, const void* src, u64 size, bool hash) {
     u64 out_hash = 0;
     for (u64 o = 0; o < size;) {
         const u64 a = dst + o, n = std::min(kBacking - (a & (kBacking - 1)), size - o);
-        const auto* e = (a >> 40) ? nullptr : backing.find(a / kBacking);
-        if (!e || !*e) return 0;
-        u8* p = *e + (a & (kBacking - 1));
+        u8* p = *backing.find(a / kBacking) + (a & (kBacking - 1));
         if (hash && size == n) out_hash = Gpu::PieceHash::Copy(p, s + o, n);
         else std::memcpy(p, s + o, n);
         o += n;
@@ -1111,16 +1111,13 @@ u64 CopyBacking(u64 dst, const void* src, u64 size, bool hash) {
     return out_hash ? out_hash : (hash ? Gpu::PieceHash::Hash(src, size) : 0);
 }
 
-u32 Generation() { return generation.load(std::memory_order_acquire); }
-
 bool Readable(u64 addr, u64 size) {
     if (!size) return true;
     const u64 p0 = addr / kPage, p1 = (addr + size + kPage - 1) / kPage;
     if (p1 <= kPages && All(known.get(), p0, p1)) return All(readable.get(), p0, p1);
-    // Synchronize against concurrent Forget() before caching host readability bits.
-    std::shared_lock l(map_lock);
-    if (p1 <= kPages && All(known.get(), p0, p1)) return All(readable.get(), p0, p1);
-    u64 a = addr;
+    // Each region queried is learned whole.
+    const u32 gen = generation.load(std::memory_order_acquire);
+    u64 lo = 0, a = addr;
     bool ok = true;
     while (ok && a < addr + size) {
 #ifdef _WIN32
@@ -1139,8 +1136,9 @@ bool Readable(u64 addr, u64 size) {
         ok = range.read;
 #endif
         Mark(readable.get(), base / kPage, end / kPage, ok), Mark(known.get(), base / kPage, end / kPage, true);
-        a = end;
+        lo = a == addr ? base : lo, a = end;
     }
+    if (generation.load(std::memory_order_acquire) != gen) Mark(known.get(), lo / kPage, a / kPage, false);  // may be gone
     return ok;
 }
 } // namespace Gow3::GuestMemory

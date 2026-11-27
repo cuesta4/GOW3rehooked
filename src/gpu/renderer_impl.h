@@ -326,6 +326,7 @@ struct Renderer::Impl {
     std::vector<VkDeviceMemory> chunks;
     u64 chunk_size = kChunk;
     u64 chunk_used = kChunk;
+    bool chunk_failed = false;  // a chunk allocation failed (logged once)
     std::vector<u64> bound;  // bitmap of mirror pages with memory
     std::vector<VkSparseMemoryBind> pending_binds;
     std::atomic<u64> mirror_chunks{0}, device_buffers{0}, host_buffers{0};  // debug: Vulkan memory held (bytes)
@@ -773,7 +774,6 @@ struct Renderer::Impl {
     }
     static inline thread_local Flat<ProgMemo> prog_memo;   // program address | stage -> this frame's code, hash, fetch SGPR
     static inline thread_local Flat<ProgMemo> fetch_memo;  // fetch shader address -> this frame's code and hash
-    static inline thread_local u32 prog_memo_gen = ~0u;    // GuestMemory::Generation() when prog_memo/fetch_memo were populated
     std::unordered_map<u64, ShaderRef> rect_gs;            // VS output mask -> rect list geometry shader
     ShaderRef clear_rect_ref{};                            // the SDK clear's four strip vertices
     bool HasClearRectVs() const { return bool(clear_rect_ref); }

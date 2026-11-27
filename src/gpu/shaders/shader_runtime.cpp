@@ -8,9 +8,6 @@
 #include "gpu/textures.h"
 #include "gpu/renderer_impl.h"
 #include "main/host.h"
-#ifndef GOW3_OFFLINE
-#include "gpu/buffers.h"
-#endif
 
 namespace Gpu {
 namespace {
@@ -390,10 +387,6 @@ ShaderRef Renderer::Impl::Translated(Gcn::Stage stage, u64 prog, const CpuRead& 
 
 bool Renderer::Impl::Identify(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, bool rect, Prepared& p) {
     RenderProbe::Scope identify_time(RenderProbe::Identify);
-#ifndef GOW3_OFFLINE
-    if (const u32 gen = Gow3::GuestMemory::Generation(); prog_memo_gen != gen)
-        prog_memo.clear(), fetch_memo.clear(), prog_memo_gen = gen;
-#endif
     // Code, content hash and fetch SGPR, checked once per program per frame: read again only when a page under the code
     // changed (Version), every frame when that is unknown.
     auto stale = [&](ProgMemo& m, u64 a) {
