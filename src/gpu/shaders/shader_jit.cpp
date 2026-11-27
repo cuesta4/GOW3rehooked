@@ -328,23 +328,8 @@ std::shared_future<CompiledPipeline> Renderer::Impl::AsyncPipeline(u64 h, Shader
             CompiledPipeline pl{};
             const auto t = std::chrono::steady_clock::now();
             PlOrigin origin = urgent ? kPlHit : kPlAheadHit;
-            if (caps.path == ShaderPath::Gpl && has_ps) {
-                const VkPipeline vi = gpl_vi[std::min<u8>(state.topology_class, 2)];
-                const VkPipeline prerast = GetGplPreRaster(vs, gs, state);
-                const VkPipeline fs = GetGplFragShader(ps, state);
-                const VkPipeline foi = GetGplFragOutput(state, false);
-                const bool need_sq = state.NeedsSquarePipeline(caps);
-                const VkPipeline foi_sq = need_sq ? GetGplFragOutput(state, true) : VK_NULL_HANDLE;
-                if (vi && prerast && fs && foi && (!need_sq || foi_sq)) {
-                    const VkPipeline libs[4]{vi, prerast, fs, foi};
-                    if (caps.cache_control && probe) pl = LinkGplPair(libs, foi_sq, true, true);
-                    if (!pl.main) pl = LinkGplPair(libs, foi_sq, true, false), origin = urgent ? kPlGplLto : kPlAhead;
-                }
-            }
-            if (!pl.main) {
-                if (caps.cache_control && probe) pl = CreateMonolithicPipeline(vs, ps, gs, state, true);
-                if (!pl.main) pl = CreateMonolithicPipeline(vs, ps, gs, state, false), origin = urgent ? kPlMiss : kPlAhead;
-            }
+            if (caps.cache_control && probe) pl = CreateMonolithicPipeline(vs, ps, gs, state, true);
+            if (!pl.main) pl = CreateMonolithicPipeline(vs, ps, gs, state, false), origin = urgent ? kPlMiss : kPlAhead;
             const u32 us = u32(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t).count());
             CompiledPipeline ret = pl;
             {
@@ -477,32 +462,8 @@ bool Renderer::Impl::ExtractDiscoverPipelineState(bool rect, bool rect_vs, bool 
     return true;
 }
 
-void Renderer::Impl::EnqueueGplLto(u64 h, const VkPipeline (&libs)[4], VkPipeline foi_sq) {
-    {
-        std::unique_lock lock(prog_lock);
-        if (!gpl_lto_queued.insert(h).second) return;
-    }
-    Queue([this, h, l0 = libs[0], l1 = libs[1], l2 = libs[2], l3 = libs[3], foi_sq] {
-        const auto t = std::chrono::steady_clock::now();
-        const VkPipeline main_libs[4]{l0, l1, l2, l3};
-        const CompiledPipeline pl = LinkGplPair(main_libs, foi_sq, true, false);
-        if (!pl.main) return;
-        const u32 us = u32(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t).count());
-        std::unique_lock lock(prog_lock);
-        if (auto it = pipelines.find(h); it != pipelines.end()) {
-            if (it->second.main) retired_pipelines.push_back(it->second.main);
-            if (it->second.square) retired_pipelines.push_back(it->second.square);
-            it->second = pl;
-            std::atomic_ref(pipeline_epoch).fetch_add(1, std::memory_order_release);
-        } else {
-            pipelines.emplace(h, pl);
-        }
-        if (temp_pipelog) TempPlOrigin(h, kPlGplLto, us);
-    }, 1);
-}
-
 void Renderer::Impl::EnqueuePipeline(u64 vs_key, u64 ps_key, bool has_gs, const FixedPipelineState& raw_state) {
-    if (!vs_key || caps.path == ShaderPath::Objects || (caps.path == ShaderPath::Gpl && caps.gpl_fast_link && ps_key)) return;
+    if (!vs_key || (caps.path != ShaderPath::Monolithic && !(caps.path == ShaderPath::Gpl && !ps_key))) return;
     ShaderRef vs{}, ps{}, gs{};
     u64 gs_mask = 0;
     {
@@ -565,8 +526,7 @@ void Renderer::Impl::Discover(const CpuRead& cpu, Pos to, bool urgent) {
             const u64 vs_key = Enqueue(Gcn::Stage::Vertex, vs_addr, &sh[0x4C], cpu, sh[0x4A], sh[0x4B], rect_vs, urgent);
             const bool want_ps = ps_addr && (mode == 1 || (ctx[0x203] & 0x41));
             const u64 ps_key = want_ps ? Enqueue(Gcn::Stage::Pixel, ps_addr, &sh[0x0C], cpu, sh[0x0A], sh[0x0B], rect, urgent) : 0;
-            if ((caps.path == ShaderPath::Monolithic || (caps.path == ShaderPath::Gpl && (!ps_key || !caps.gpl_fast_link))) &&
-                vs_key && !(want_ps && mode == 1 && !ps_key)) {
+            if ((caps.path == ShaderPath::Monolithic || (caps.path == ShaderPath::Gpl && !ps_key)) && vs_key && !(want_ps && mode == 1 && !ps_key)) {
                 FixedPipelineState raw_state{};
                 if (ExtractDiscoverPipelineState(rect, rect_vs, ps_key != 0, raw_state))
                     EnqueuePipeline(vs_key, ps_key, rect && !rect_vs, raw_state);

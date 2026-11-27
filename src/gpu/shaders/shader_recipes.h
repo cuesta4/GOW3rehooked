@@ -36,9 +36,7 @@ struct Recipe {
     std::uint64_t Key() const;  // the translation key the JIT computes for this variant
     // The variant on any GPU: its fields without the bit the runtime sets for the GPU in use (no storage reads without a format).
     std::uint64_t Id() const;
-    void Adapt(bool no_storage_read_nofmt, bool no_float_controls = false) {
-        h.reserved = (h.reserved & ~((1u << 16) | (1u << 17))) | (no_storage_read_nofmt ? 1u << 16 : 0u) | (no_float_controls ? 1u << 17 : 0u);
-    }
+    void Adapt(bool no_storage_read_nofmt) { h.reserved = (h.reserved & ~(1u << 16)) | (no_storage_read_nofmt ? 1u << 16 : 0u); }
     // The recipe of `in` (its code and fetch hashes given) with `spec`.
     static Recipe From(const Gcn::Input& in, std::uint64_t code_hash, std::uint64_t fetch_hash, std::span<const Gcn::SlotSpec> spec);
 };
@@ -70,7 +68,7 @@ public:
     std::vector<Recipe> All() const;
     // The pipeline recipes as this GPU and sample count draw them (translation keys, raw states). Left out: those whose
     // programs hold to another sample count they were met with (multisampled images, the interlock's blend) or need an interlock.
-    std::vector<GraphicsPipelineKey> Pipelines(bool no_storage_read_nofmt, bool interlock, bool no_float_controls = false) const;
+    std::vector<GraphicsPipelineKey> Pipelines(bool no_storage_read_nofmt, bool interlock) const;
 
 private:
     void Append(std::uint32_t type, const void* a, std::size_t na, const void* b = nullptr, std::size_t nb = 0);

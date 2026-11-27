@@ -25,10 +25,9 @@ struct OldPipeline {
     FixedPipelineState raw_state;
 };
 std::uint64_t Hash(const PipelineRecipe& p) { return PieceHash::Stable64(&p, sizeof(p)); }
-std::uint64_t KeyOf(const Recipe& r, bool no_storage_read_nofmt, bool no_float_controls = false) {
+std::uint64_t KeyOf(const Recipe& r, bool no_storage_read_nofmt) {
     Gcn::Input in = r.Input();
     in.no_storage_read_nofmt = no_storage_read_nofmt;
-    in.no_float_controls = no_float_controls;
     return TranslationKey(ProgramKey(Gcn::Stage(r.h.stage), r.h.code_hash, r.h.fetch_hash, r.h.rsrc2, false, false), in, r.Specs());
 }
 // The variant holds to the sample count it was met with: it reads multisampled images or blends through the interlock (by that count).
@@ -42,7 +41,6 @@ Gcn::Input Recipe::Input() const {
     in.stage = Gcn::Stage(h.stage), in.rsrc1 = h.rsrc1, in.rsrc2 = h.rsrc2, in.rect = h.rect;
     in.blend_interlock = h.reserved & 0xFFFFu;
     in.no_storage_read_nofmt = (h.reserved >> 16 & 1) != 0;
-    in.no_float_controls = (h.reserved >> 17 & 1) != 0;
     in.ps_input_ena = h.ps_input_ena, in.ps_input_addr = h.ps_input_addr, in.col_format = h.col_format;
     std::memcpy(in.ps_input_cntl, h.cntl, sizeof(h.cntl)), std::memcpy(in.threads, h.threads, sizeof(h.threads));
     std::memcpy(in.mrt_class, h.mrt_class, 8), std::memcpy(in.mrt_map, h.mrt_map, 8);
@@ -56,11 +54,11 @@ std::vector<Gcn::SlotSpec> Recipe::Specs() const {
     return s;
 }
 
-std::uint64_t Recipe::Key() const { return KeyOf(*this, (h.reserved >> 16 & 1) != 0, (h.reserved >> 17 & 1) != 0); }
+std::uint64_t Recipe::Key() const { return KeyOf(*this, (h.reserved >> 16 & 1) != 0); }
 
 std::uint64_t Recipe::Id() const {
     RecipeHead head = h;
-    head.reserved &= ~((1u << 16) | (1u << 17));
+    head.reserved &= ~(1u << 16);
     return PieceHash::Stable64Seeded(spec.data(), spec.size() * 8, PieceHash::Stable64(&head, sizeof(head)));
 }
 
@@ -73,7 +71,7 @@ Recipe Recipe::From(const Gcn::Input& in, std::uint64_t code_hash, std::uint64_t
     std::memcpy(h.cntl, in.ps_input_cntl, sizeof(h.cntl)), std::memcpy(h.threads, in.threads, sizeof(h.threads));
     std::memcpy(h.mrt_class, in.mrt_class, 8), std::memcpy(h.mrt_map, in.mrt_map, 8);
     h.nspec = std::uint16_t(spec.size()), h.stage = std::uint8_t(in.stage), h.rect = in.rect;
-    h.reserved = (in.blend_interlock & 0xFFFFu) | (in.no_storage_read_nofmt ? (1u << 16) : 0u) | (in.no_float_controls ? (1u << 17) : 0u);
+    h.reserved = (in.blend_interlock & 0xFFFFu) | (in.no_storage_read_nofmt ? (1u << 16) : 0u);
     for (const Gcn::SlotSpec& s : spec) r.spec.push_back(Gcn::Pack(s));
     return r;
 }
@@ -220,7 +218,7 @@ bool Recipes::AddPipeline(std::uint64_t vs_key, std::uint64_t ps_key, std::uint6
     return true;
 }
 
-std::vector<GraphicsPipelineKey> Recipes::Pipelines(bool no_storage_read_nofmt, bool interlock, bool no_float_controls) const {
+std::vector<GraphicsPipelineKey> Recipes::Pipelines(bool no_storage_read_nofmt, bool interlock) const {
     const std::vector<Recipe> variants = All();  // the keys are made without the lock: draws note recipes meanwhile
     std::vector<PipelineRecipe> kept;
     {
@@ -234,7 +232,7 @@ std::vector<GraphicsPipelineKey> Recipes::Pipelines(bool no_storage_read_nofmt, 
     std::unordered_map<std::uint64_t, Local> local{{kClearRectVsKey, {kClearRectVsKey, false}}};  // Id -> this GPU's variant
     local.reserve(variants.size() + 1);
     for (const Recipe& r : variants)
-        if (interlock || !(r.h.reserved & 0xFFFFu)) local.try_emplace(r.Id(), Local{KeyOf(r, no_storage_read_nofmt, no_float_controls), HoldsSamples(r)});
+        if (interlock || !(r.h.reserved & 0xFFFFu)) local.try_emplace(r.Id(), Local{KeyOf(r, no_storage_read_nofmt), HoldsSamples(r)});
     std::vector<GraphicsPipelineKey> out;
     out.reserve(kept.size());
     for (const PipelineRecipe& p : kept) {

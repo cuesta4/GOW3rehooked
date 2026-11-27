@@ -361,7 +361,7 @@ ShaderRef Renderer::Impl::Translated(Gcn::Stage stage, u64 prog, const CpuRead& 
         bool own = false;
         {
             std::unique_lock lock(prog_lock);
-            if (found()) return memo[key] = {shaders.find(key)->second, out_mask}, shaders.find(key)->second;
+            if (found()) return shaders.find(key)->second;
             auto [it, fresh] = compiling.try_emplace(key);
             if (fresh) it->second = built ? here.get_future().share() : Async(stage, prog, p, true), own = built;
             f = it->second;
@@ -378,42 +378,37 @@ ShaderRef Renderer::Impl::Translated(Gcn::Stage stage, u64 prog, const CpuRead& 
             const ShaderRef cr = c.Ref(key);
             if (cr && cr != shaders.find(key)->second) DestroyShaderRef(cr);
         }
-        return memo[key] = {shaders.find(key)->second, out_mask}, shaders.find(key)->second;
+        return shaders.find(key)->second;
     }
     compiling.erase(key);
     if (stage == Gcn::Stage::Vertex) vs_outputs[key] = out_mask = c.out_mask;
     Count(stats.shaders);
     const ShaderRef ref = c.Ref(key);
     if (!c.Ready(caps.path, stage)) Count(stats.shader_fail), Note(std::format("shader {:x} stage {}: {}", prog, (int)stage, c.err.substr(0, 300)));
-    return memo[key] = {ref, out_mask}, shaders[key] = ref;
-}
-
-ProgMemo& Renderer::Impl::RefreshProgMemo(Gcn::Stage stage, u64 prog, const CpuRead& cpu) {
-#ifndef GOW3_OFFLINE
-    if (const u32 gen = Gow3::GuestMemory::Generation(); prog_memo_gen != gen)
-        prog_memo.clear(), fetch_memo.clear(), prog_memo_gen = gen;
-#endif
-    ProgMemo& pm = prog_memo[prog | (u64)stage];
-    if (pm.frame != frame) {
-        const bool dirty_code = !pm.ver || pm.ver != Version(prog, pm.code.size_bytes());
-        pm.frame = frame;
-        if (dirty_code) {
-            pm.code = Program(prog, cpu);
-            pm.hash = ::Gpu::PieceHash::ShaderCode(pm.code.data(), pm.code.size_bytes());
-            pm.orb_hash = pm.code.empty() ? 0 : ReadOrbFooterHash(prog, pm.code.size_bytes(), cpu);
-            pm.fetch_sgpr = stage == Gcn::Stage::Vertex ? FetchSgpr(pm.code) : -1;
-            pm.ver = Version(prog, pm.code.size_bytes());
-            pm.blend_key = ~0ull;
-        }
-    }
-    return pm;
+    return shaders[key] = ref;
 }
 
 bool Renderer::Impl::Identify(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, bool rect, Prepared& p) {
     RenderProbe::Scope identify_time(RenderProbe::Identify);
+#ifndef GOW3_OFFLINE
+    if (const u32 gen = Gow3::GuestMemory::Generation(); prog_memo_gen != gen)
+        prog_memo.clear(), fetch_memo.clear(), prog_memo_gen = gen;
+#endif
     // Code, content hash and fetch SGPR, checked once per program per frame: read again only when a page under the code
     // changed (Version), every frame when that is unknown.
-    const ProgMemo& pm = RefreshProgMemo(stage, prog, cpu);
+    auto stale = [&](ProgMemo& m, u64 a) {
+        if (m.frame == frame) return false;
+        m.frame = frame;
+        return !m.ver || m.ver != Version(a, m.code.size_bytes());
+    };
+    ProgMemo& pm = prog_memo[prog | (u64)stage];
+    if (stale(pm, prog)) {
+        pm.code = Program(prog, cpu);
+        pm.hash = ::Gpu::PieceHash::ShaderCode(pm.code.data(), pm.code.size_bytes());
+        pm.orb_hash = pm.code.empty() ? 0 : ReadOrbFooterHash(prog, pm.code.size_bytes(), cpu);
+        pm.fetch_sgpr = stage == Gcn::Stage::Vertex ? FetchSgpr(pm.code) : -1;
+        pm.ver = Version(prog, pm.code.size_bytes());
+    }
     const auto code = pm.code;
     if (code.empty()) return Note(std::format("program {:x} unreadable", prog)), false;
     std::span<const u32> fetch;
@@ -421,8 +416,7 @@ bool Renderer::Impl::Identify(Gcn::Stage stage, u64 prog, const u32* user, const
     if (const int s = pm.fetch_sgpr; s >= 0 && s < 15)
         if (const u64 fa = (u64)(user[s + 1] & 0xFFFF) << 32 | user[s]) {
             ProgMemo& fm = fetch_memo[fa];
-            const bool stale = fm.frame != frame && (fm.frame = frame, !fm.ver || fm.ver != Version(fa, fm.code.size_bytes()));
-            if (stale) fm.code = FetchProgram(fa, cpu), fm.hash = ::Gpu::PieceHash::ShaderCode(fm.code.data(), fm.code.size_bytes()), fm.ver = Version(fa, fm.code.size_bytes());
+            if (stale(fm, fa)) fm.code = FetchProgram(fa, cpu), fm.hash = ::Gpu::PieceHash::ShaderCode(fm.code.data(), fm.code.size_bytes()), fm.ver = Version(fa, fm.code.size_bytes());
             fetch = fm.code, fetch_hash = fm.hash;
         }
     p.spec.clear(), p.desc.clear(), p.fdesc.clear(), p.in = {}, p.rect = rect;
@@ -435,7 +429,6 @@ bool Renderer::Impl::Identify(Gcn::Stage stage, u64 prog, const u32* user, const
     in.boom = boom_on && !in.probe && stage == Gcn::Stage::Vertex;
     in.rect = rect && stage == Gcn::Stage::Vertex;
     in.no_storage_read_nofmt = !caps.storage_image_read_without_format;
-    in.no_float_controls = !caps.signed_zero_inf_nan_preserve;
     static const char* probe_pc = DebugOption("GOW3_PROBE_PC");  // e.g. 100017: after the fetch
     if (in.probe && probe_pc) in.probe_pc = (u32)std::strtoul(probe_pc, nullptr, 16);
     p.pkey = ProgramKey(stage, pm.hash, fetch_hash, rsrc2, in.probe, in.boom);
@@ -537,7 +530,6 @@ u64 TranslationKey(u64 program_key, const Gcn::Input& in, std::span<const Gcn::S
                                    ::Gpu::PieceHash::ShaderKey(&in.mrt_class, 16, key ^ in.ps_input_ena ^ (u64)in.ps_input_addr << 32 ^ in.col_format));
     if (in.blend_interlock) key = ::Gpu::PieceHash::ShaderKey(&in.blend_interlock, sizeof(in.blend_interlock), key);
     if (in.no_storage_read_nofmt) key ^= 0x53544F524E4F5244ull;
-    if (in.no_float_controls) key ^= 0x464C544354524C30ull;
     return key;
 }
 
@@ -1202,14 +1194,8 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
             const VkPipeline libs[4]{vi, prerast, fs, foi};
             CompiledPipeline pl = LinkGplPair(libs, foi_sq, true, true);
             const PlOrigin origin = pl.main ? kPlGplLto : kPlGplLink;
-            if (!pl.main && (caps.gpl_fast_link || stats.trace || Jit::mode != Jit::Mode::Async))
-                pl = LinkGplPair(libs, foi_sq, false, false);
-            if (pl.main) {
-                const CompiledPipeline kept = KeepPipeline(h, pl, origin);
-                if (origin == kPlGplLink && !stats.trace && caps.gpl_fast_link && kept.main == pl.main)
-                    EnqueueGplLto(h, libs, foi_sq);
-                return pm[rh] = kept;
-            }
+            if (!pl.main) pl = LinkGplPair(libs, foi_sq, false, false);
+            if (pl.main) return pm[rh] = KeepPipeline(h, pl, origin);
         }
     }
     // A pipeline in the pipeline cache (built by the AOT or an earlier run) still costs the driver a load. Async: the load
@@ -1292,7 +1278,7 @@ void Renderer::Impl::TempPlWrite() {
                         u32(caps.alpha_to_coverage_enable) << 3 | u32(caps.color_blend_enable) << 4 | u32(caps.color_blend_equation) << 5 |
                         u32(caps.color_write_mask) << 6 | u32(caps.unrestricted_topology) << 7;
     // Format 2: the pipeline recipes as this GPU draws them follow (raw keys).
-    const auto recipes = Recipes::Instance().Pipelines(!caps.storage_image_read_without_format, blend_interlock, !caps.signed_zero_inf_nan_preserve);
+    const auto recipes = Recipes::Instance().Pipelines(!caps.storage_image_read_without_format, blend_interlock);
     const u32 head[8]{0x4C503347, 2, u32(caps.path), capbits, u32(temp_pl_states.size()), u32(temp_pl_made.size()), u32(recipes.size()), 0};  // "G3PL"
     std::vector<u8> out;
     const auto append = [&](const void* p, size_t n) { out.insert(out.end(), (const u8*)p, (const u8*)p + n); };
@@ -1324,7 +1310,7 @@ void Renderer::Impl::TempPlWrite() {
 void Renderer::Impl::WarmPipelines() {
     if (caps.path == ShaderPath::Objects || !caps.cache_control) return;
     std::call_once(warm_once, [&] {  // the recipes as this GPU draws them (those this run meets are made by then)
-        warm_recipes = Recipes::Instance().Pipelines(!caps.storage_image_read_without_format, blend_interlock, !caps.signed_zero_inf_nan_preserve);
+        warm_recipes = Recipes::Instance().Pipelines(!caps.storage_image_read_without_format, blend_interlock);
         for (GraphicsPipelineKey& k : warm_recipes) k.state.Canonicalize(caps);
     });
     for (const GraphicsPipelineKey& gk : warm_recipes) {

@@ -580,33 +580,9 @@ struct Renderer::Impl {
     u32 evict_binding = 0;
     std::vector<std::pair<u64, u64>> dirty;  // guest ranges written for this frame, sorted
     // 4 KB piece -> the frame whose `dirty` last held it (demand-zero, as `written`): Check finds the writes of the frames a
-    // texture skipped. A 256 KB coarse summary lets multi-MB textures skip clean cold regions.
-    static constexpr u64 kCoarseShift = 6, kCoarsePieces = (kPieces + 63) >> kCoarseShift;
+    // texture skipped.
     std::unique_ptr<u32, decltype(&std::free)> staged_table{(u32*)std::calloc(kPieces, sizeof(u32)), &std::free};
-    std::unique_ptr<u32, decltype(&std::free)> staged_coarse{(u32*)std::calloc(kCoarsePieces, sizeof(u32)), &std::free};
     u32 frame = 0;
-    void MarkStaged(u64 lo, u64 hi) {
-        const u64 end = std::min((hi + 0xFFF) >> 12, kPieces);
-        u32* fine = staged_table.get();
-        u32* coarse = staged_coarse.get();
-        for (u64 p = lo >> 12; p < end; ++p) fine[p] = frame, coarse[p >> kCoarseShift] = frame;
-    }
-    bool StagedAfter(u64 lo, u64 hi, u32 since) const {
-        const u64 p0 = lo >> 12, end = std::min((hi + 0xFFF) >> 12, kPieces);
-        if (p0 >= end) return false;
-        const u32* fine = staged_table.get();
-        const u32* coarse = staged_coarse.get();
-        for (u64 c = p0 >> kCoarseShift, c_end = (end - 1) >> kCoarseShift; c <= c_end; ++c) {
-            if (coarse[c] <= since) continue;
-            for (u64 p = std::max(p0, c << kCoarseShift), pe = std::min(end, (c + 1) << kCoarseShift); p < pe; ++p)
-                if (fine[p] > since) return true;
-        }
-        return false;
-    }
-    static bool OverlapsRanges(const std::vector<std::pair<u64, u64>>& rs, u64 lo, u64 hi) {
-        auto it = std::upper_bound(rs.begin(), rs.end(), std::pair{hi, 0ull});
-        return it != rs.begin() && std::prev(it)->second > lo;
-    }
     // Guest textures unused for more than `age` frames: bindless elements freed (no frame samples them), views and images
     // destroyed by Reap once the frame being recorded has retired (it and the frame in flight may still copy from them).
     void EvictTextures(u32 age, bool defer_elements = false);
@@ -652,7 +628,6 @@ struct Renderer::Impl {
         bool guest_synced = false;  // guest RAM and WrittenSlot already match mirror (RecordReadback skips it)
     };
     std::vector<GpuWrite> gpu_writes;  // this frame
-    u64 gpu_writes_lo = ~0ull, gpu_writes_hi = 0;
     std::vector<GpuWrite> last_writes;  // the last frame's: textures over them in another image are uploaded again
     std::vector<GpuWrite> lazy_writes;  // earlier frames' lazy ones not written back yet (one per image and range)
     std::vector<std::pair<GpuWrite, bool>> prologue_lazy;  // those the frame's prologue writes back before its uploads (Check; `learn`)
@@ -672,17 +647,6 @@ struct Renderer::Impl {
     // own (`own_writes`); `synced_here` tracks the images it uploaded again. The serial walk sees everything.
     static inline thread_local size_t horizon = ~size_t(0);
     static inline thread_local std::vector<GpuWrite> own_writes;
-    static inline thread_local u64 own_writes_lo = ~0ull, own_writes_hi = 0;
-    void PushGpuWrite(const GpuWrite& w) {
-        gpu_writes.push_back(w);
-        gpu_writes_lo = std::min(gpu_writes_lo, w.lo), gpu_writes_hi = std::max(gpu_writes_hi, w.hi);
-    }
-    void PushWrite(const GpuWrite& w) {
-        if (in_worker) own_writes.push_back(w), own_writes_lo = std::min(own_writes_lo, w.lo), own_writes_hi = std::max(own_writes_hi, w.hi);
-        else PushGpuWrite(w);
-    }
-    void ClearOwnWrites() { own_writes.clear(), own_writes_lo = ~0ull, own_writes_hi = 0; }
-    void ClearGpuWrites() { gpu_writes.clear(), gpu_writes_lo = ~0ull, gpu_writes_hi = 0; }
     static inline thread_local std::unordered_map<const GuestTex*, u64>* synced_here = nullptr;
     static inline thread_local std::vector<std::pair<GuestTex*, u32>> stores;  // storage images (and level) of the current dispatch or draw
     // Consecutive dispatches share one barrier and write-back: the storage images of those recorded since the last one, not
@@ -765,17 +729,10 @@ struct Renderer::Impl {
         TargetKey key;  // the whole key: entries are found by its hash
         const Target* t;
     };
-    struct MemoAttach {
-        const Target* t = nullptr;
-        VkFormat fmt = VK_FORMAT_UNDEFINED;
-        VkImageView view = VK_NULL_HANDLE;
-    };
     struct Memo {
         const Impl* owner = nullptr;
         u64 epoch = ~0ull;
-        u64 pipeline_epoch = ~0ull;
         Flat<MemoTarget> targets;
-        Flat<MemoAttach> target_attach;
         Flat<u32> samplers;
         Flat<MemoTex> tex;                       // T# hash + binding
         Flat<std::pair<ShaderRef, u64>> shaders; // translation key -> shader, VS output mask
@@ -783,13 +740,11 @@ struct Renderer::Impl {
         Flat<ProgUse> progs;                     // program key -> its slots and last inputs
     };
     static thread_local Memo memo;
-    u64 epoch = 0, pipeline_epoch = 0;
+    u64 epoch = 0;
     Memo& Memos() {
         if (memo.owner != this) memo = {}, memo.owner = this;
         if (const u64 e = std::atomic_ref(epoch).load(std::memory_order_acquire); memo.epoch != e)
-            memo.tex.clear(), memo.targets.clear(), memo.target_attach.clear(), memo.epoch = e;
-        if (const u64 pe = std::atomic_ref(pipeline_epoch).load(std::memory_order_acquire); memo.pipeline_epoch != pe)
-            memo.pipelines.clear(), memo.pipeline_epoch = pe;
+            memo.tex.clear(), memo.targets.clear(), memo.epoch = e;
         return memo;
     }
     static inline thread_local bool table_ps = false;  // the table being built is a pixel shader's
@@ -819,7 +774,6 @@ struct Renderer::Impl {
     static inline thread_local Flat<ProgMemo> prog_memo;   // program address | stage -> this frame's code, hash, fetch SGPR
     static inline thread_local Flat<ProgMemo> fetch_memo;  // fetch shader address -> this frame's code and hash
     static inline thread_local u32 prog_memo_gen = ~0u;    // GuestMemory::Generation() when prog_memo/fetch_memo were populated
-    ProgMemo& RefreshProgMemo(Gcn::Stage stage, u64 prog, const CpuRead& cpu);
     std::unordered_map<u64, ShaderRef> rect_gs;            // VS output mask -> rect list geometry shader
     ShaderRef clear_rect_ref{};                            // the SDK clear's four strip vertices
     bool HasClearRectVs() const { return bool(clear_rect_ref); }
@@ -831,8 +785,6 @@ struct Renderer::Impl {
     std::mutex pipeline_cache_save_lock;
     size_t pipeline_cache_bytes = 0;  // the last save's (or load's) size, under pipeline_cache_save_lock
     std::unordered_map<u64, CompiledPipeline> pipelines;   // GraphicsPipelineKey::Hash() -> main/square VkPipeline (under prog_lock)
-    std::unordered_set<u64> gpl_lto_queued;                // fast-linked GPL pipelines queued for background LTO (under prog_lock)
-    std::vector<VkPipeline> retired_pipelines;             // fast-linked handles replaced by LTO, destroyed on shutdown (under prog_lock)
     // Tier 2 (Gpl): 4-part Graphics Pipeline Library caches (under prog_lock).
     VkPipeline gpl_vi[3]{};                              // Vertex Input Interface: POINT_LIST, LINE_LIST, TRIANGLE_LIST
     std::unordered_map<u64, VkPipeline> gpl_prerast;     // Pre-Rasterization library cache (VS+GS or non-default static flags)
@@ -858,7 +810,7 @@ struct Renderer::Impl {
         bool rect = false;
     };
     static thread_local Prepared prep;  // Shader's, reused (its vectors keep their capacity)
-    static inline thread_local std::vector<u32> vs_table, ps_table, cs_table;  // Draw/Dispatch tables, reused
+    static inline thread_local std::vector<u32> vs_table, ps_table;  // Draw's, reused
     static constexpr u32 kInputs = 512;
     static inline thread_local u32 inputs[kInputs];                  // Shader's: what makes its variant and slot elements
     static inline thread_local std::vector<MemoTex> slot_used;       // Shader's: each slot's, for Recent
@@ -941,7 +893,6 @@ struct Renderer::Impl {
     VkPipeline GetGplFragOutput(const FixedPipelineState& state, bool square_pass);
     VkPipeline LinkGplPipeline(const VkPipeline (&libs)[4], bool lto, bool fail_on_compile);
     CompiledPipeline LinkGplPair(const VkPipeline (&main_libs)[4], VkPipeline foi_square, bool lto, bool fail_on_compile);
-    void EnqueueGplLto(u64 h, const VkPipeline (&libs)[4], VkPipeline foi_sq);
     CompiledPipeline GetGraphicsPipeline(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
                                          const FixedPipelineState& raw_state, const CpuRead& cpu);
     // TEMP pipeline log (debug runs, GOW3_TEMP_PIPELOG=0: off): every distinct draw state (programs, raw state) with its frames
@@ -1005,7 +956,6 @@ struct Renderer::Impl {
     VkSemaphore copied = VK_NULL_HANDLE, bound_sem = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     std::vector<VkBufferCopy> back;  // GPU writes copied to `rb`: guest address, rb offset, size
-    std::vector<std::pair<u64, u64>> back_ranges;  // sorted, disjoint [lo, hi) intervals mirrored by `back`
     // Copy engine (a transfer-only family): `xfer` is its first queue; on its second (`rbq`) the frame's GPU writes go
     // from `rb_dev` (copied there in VRAM at the frame's end) to the host once the frame signals `rendered`.
     u32 copy_family = ~0u;
@@ -1024,7 +974,6 @@ struct Renderer::Impl {
         std::vector<Buffer> stage, stage_dev, temp;
         u32 temp_quiet = 0, scratch_quiet = 0, stage_quiet = 0, rb_quiet = 0;
         std::vector<VkBufferCopy> back;
-        std::vector<std::pair<u64, u64>> back_ranges;
         bool busy = false;
         u64 frame = 0;              // its number (Submit's count)
         u32 slot = 1, queries = 0;  // queries: occlusion queries recorded (query_pool)
@@ -1035,7 +984,7 @@ struct Renderer::Impl {
         std::swap(primary, flight.primary), std::swap(copy_cmd, flight.copy_cmd), std::swap(xfer_cmd, flight.xfer_cmd), std::swap(copied, flight.copied);
         std::swap(rb_cmd, flight.rb_cmd), std::swap(rendered, flight.rendered), std::swap(bound_sem, flight.bound_sem), std::swap(rb_dev, flight.rb_dev), std::swap(send_cmd, flight.send_cmd);
         std::swap(fence, flight.fence), std::swap(tables_host, flight.tables_host), std::swap(tables, flight.tables), std::swap(stage_dev, flight.stage_dev);
-        std::swap(rb, flight.rb), std::swap(scratch, flight.scratch), std::swap(stage, flight.stage), std::swap(frame_temp, flight.temp), std::swap(back, flight.back), std::swap(back_ranges, flight.back_ranges), std::swap(slot, flight.slot);
+        std::swap(rb, flight.rb), std::swap(scratch, flight.scratch), std::swap(stage, flight.stage), std::swap(frame_temp, flight.temp), std::swap(back, flight.back), std::swap(slot, flight.slot);
         std::swap(temp_quiet, flight.temp_quiet), std::swap(scratch_quiet, flight.scratch_quiet), std::swap(stage_quiet, flight.stage_quiet), std::swap(rb_quiet, flight.rb_quiet);
         temp_at = 0, temp_used = 0, scratch_used = 0, rb_used = 0;  // the slot taken back belongs to a retired frame
         std::swap(prof_base, flight.prof_base), std::swap(prof_n, flight.prof_n), std::swap(prof_label, flight.prof_label);
@@ -1057,7 +1006,6 @@ struct Renderer::Impl {
     bool query_open = false;
     std::unordered_map<u64, u32> mesh;
     u32 mesh_copied = kRays;
-    u32 slot_rays[2]{0, 0}, slot_mesh[2]{kRays, kRays};
     Buffer cond;
     u64 QueryBlock(const u32* b) const {  // the address an EVENT_WRITE dumps to when the CPU reads it, else 0
         const u64 a = ((u64)b[1] | (u64)(b[2] & 0xFFFF) << 32) & ~7ull;
@@ -1148,7 +1096,7 @@ struct Renderer::Impl {
 
     // Graphics dynamic state recorded in the current command buffer: Draw emits only what changed (reset per Submit).
     struct DynState {
-        bool valid = false, neg_one = false, bias_set = false, stencil_set = false;
+        bool valid = false, neg_one = false;
         bool pushed = false;  // `push` holds the push constants (another layout's push clears it)
         Push push{};
         VkPipeline pipeline = VK_NULL_HANDLE;

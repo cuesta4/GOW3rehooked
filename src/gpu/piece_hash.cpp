@@ -74,8 +74,8 @@ u64 XxhCopy(void* dst, const void* src, std::size_t n) {
     return XxhHash(src, n);
 }
 
-template <u64 (*CopyFn)(void*, const void*, std::size_t)>
-__attribute__((always_inline)) inline u64 BlockCopyLoop(void* dst, const void* data, std::size_t size, u64* hashes, unsigned want) {
+template <bool AesAvailable>
+__attribute__((target("aes"))) u64 BlockCopy(void* dst, const void* data, std::size_t size, u64* hashes, unsigned want) {
     auto* out = static_cast<unsigned char*>(dst);
     const auto* src = static_cast<const unsigned char*>(data);
     std::size_t count = 0;
@@ -83,17 +83,9 @@ __attribute__((always_inline)) inline u64 BlockCopyLoop(void* dst, const void* d
         if (!(want >> count & 1)) continue;
         const std::size_t n = std::min(kMemoryBlock, size - i);
         // The final avalanche is a bijection before truncation; the page root needs it only once.
-        hashes[count] = CopyFn(out + i, src + i, n);
+        hashes[count] = AesAvailable ? Aes<true, false>(out + i, src + i, n) : XxhCopy(out + i, src + i, n);
     }
     return detail::Rapid(hashes, count * sizeof(u64), size) | 1;
-}
-
-__attribute__((target("aes"))) u64 BlockCopyAes(void* dst, const void* data, std::size_t size, u64* hashes, unsigned want) {
-    return BlockCopyLoop<Aes<true, false>>(dst, data, size, hashes, want);
-}
-
-u64 BlockCopyXxh(void* dst, const void* data, std::size_t size, u64* hashes, unsigned want) {
-    return BlockCopyLoop<XxhCopy>(dst, data, size, hashes, want);
 }
 
 struct Dispatch {
@@ -120,7 +112,7 @@ bool UsesAes() { return Selected().aes; }
 std::uint64_t Hash(const void* data, std::size_t size) { return Selected().hash(data, size); }
 std::uint64_t Copy(void* dst, const void* data, std::size_t size) { return Selected().copy(dst, data, size); }
 std::uint64_t CopyBlocks(void* dst, const void* data, std::size_t size, std::uint64_t* hashes, unsigned want) {
-    return UsesAes() ? BlockCopyAes(dst, data, size, hashes, want) : BlockCopyXxh(dst, data, size, hashes, want);
+    return UsesAes() ? BlockCopy<true>(dst, data, size, hashes, want) : BlockCopy<false>(dst, data, size, hashes, want);
 }
 std::uint64_t ShaderCode(const void* p, std::size_t n) { return UsesAes() ? Hash(p, n) : Stable64(p, n); }
 std::uint64_t ShaderContent(const void* p, std::size_t n, std::uint64_t seed) {
