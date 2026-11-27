@@ -3050,7 +3050,16 @@ void Renderer::Impl::SyncLinearBacking(u64 dst_lo, u64 src_lo, u64 copy_bytes) {
 }
 
 void Renderer::Impl::FlushLinearSyncs() {
-    for (const LinSync& s : lin_syncs) SyncLinearBacking(s.dst, s.src, s.size);
+#ifndef GOW3_OFFLINE
+    for (const LinSync& s : lin_syncs) {
+        if (Gow3::GuestMemory::Readable(s.src, s.size) && Gow3::GuestMemory::HasBacking(s.dst, s.dst + s.size)) {
+            SyncLinearBacking(s.dst, s.src, s.size);
+        } else {
+            InvalidateBlocks(s.dst, s.size);
+            for (u64 p = s.dst >> 12, end = std::min((s.dst + s.size + 0xFFF) >> 12, kPieces); p < end; ++p) written[p] = 0;
+        }
+    }
+#endif
     lin_syncs.clear();
 }
 

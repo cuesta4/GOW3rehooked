@@ -1106,7 +1106,9 @@ u64 CopyBacking(u64 dst, const void* src, u64 size, bool hash) {
     u64 out_hash = 0;
     for (u64 o = 0; o < size;) {
         const u64 a = dst + o, n = std::min(kBacking - (a & (kBacking - 1)), size - o);
-        u8* p = *backing.find(a / kBacking) + (a & (kBacking - 1));
+        const auto* e = (a >> 40) ? nullptr : backing.find(a / kBacking);
+        if (!e || !*e) return 0;
+        u8* p = *e + (a & (kBacking - 1));
         if (hash && size == n) out_hash = Gpu::PieceHash::Copy(p, s + o, n);
         else std::memcpy(p, s + o, n);
         o += n;
