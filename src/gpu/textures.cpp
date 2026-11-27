@@ -2261,8 +2261,12 @@ bool Renderer::Impl::Describe(GuestTex& g, const u32* t) {
     g.storage = fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
     g.base = ((u64)t[0] | (u64)(t[1] & 0x3F) << 32) << 8;
     g.w = (t[2] & 0x3FFF) + 1, g.h = (t[2] >> 14 & 0x3FFF) + 1, g.volume = type == 10, g.d = g.volume ? depth : 1;
-    g.layers = g.volume ? 1 : cube ? depth * 6 : depth;
-    if (pow2) g.layers = std::bit_ceil(g.layers);
+    // POW2_PAD pads guest mip slice stride to a power of two (6 -> 8 faces), while Vulkan CUBE_COMPATIBLE images take the
+    // real 6*N faces (avoids 2 dead layers and an AMD PAL gfx6/Polaris AddrMgr1 mip-stride bug on arrayLayers = 8).
+    const u32 raw_layers = g.volume ? 1 : cube ? depth * 6 : depth;
+    const u32 guest_layers = pow2 ? std::bit_ceil(raw_layers) : raw_layers;
+    g.layers = raw_layers;
+    g.guest_layers = guest_layers;
     g.levels = type >= 14 ? 1 : last_level + 1;
     g.bits = NumBitsPerBlock(dfmt), g.block = IsBlockCoded(dfmt);
     g.map = DstSelect(t);
@@ -2292,18 +2296,18 @@ bool Renderer::Impl::Describe(GuestTex& g, const u32* t) {
         default: return Note(std::format("T# array mode {}", u32(array_mode))), false;
         }
         if (g.block) p = std::max(p * 4, 32u), h = std::max(h * 4, 32u);
-        g.mips[mip] = {u32(s * mip_d * g.layers), p, h, u32(g.size)};
+        g.mips[mip] = {u32(s * mip_d * guest_layers), p, h, u32(g.size)};
         g.size += g.mips[mip].size;
     }
     if (g.base + g.size > mirror_size) return Note(std::format("T# beyond the mirror (guest addresses below {} GB)", mirror_size >> 30)), false;
     g.img_levels = std::min<u32>(g.levels, std::bit_width(std::max({g.w, g.h, g.d})));
     const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |  // src: ReadTextures
                                     (g.storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
-    const bool cube_ok = cube && g.w == g.h && g.layers >= 6;  // pow2pad: 6 faces in 8 layers
+    const bool cube_ok = cube && g.w == g.h && g.layers >= 6;
     auto fail = [&](u32 w, u32 h) { return Note(std::format("texture {}x{}x{} format {} not creatable", w, h, g.layers, (int)g.fmt)), false; };
     // Block-coded and volume textures own their image. The others share their surface's (storage and sampled T#s of one
     // memory layout, bands of one surface), as big as the largest T# seen; a smaller 2D T# is its top-left part.
-    Surface* s = g.block || g.volume ? nullptr : &surfaces[{g.base, g.tile, g.bits, g.mips[0].pitch, g.layers, g.levels, g.levels > 1 ? g.w | g.h << 16 : 0}];
+    Surface* s = g.block || g.volume ? nullptr : &surfaces[{g.base, g.tile, g.bits, g.mips[0].pitch, g.layers | (g.guest_layers << 16), g.levels, g.levels > 1 ? g.w | g.h << 16 : 0}];
     std::shared_ptr<Tex> cur = s ? s->t.lock() : nullptr;
     g.flat = type == 9 || type >= 13;  // single-sampled 2D (array): views that take a sub-rectangle
     if (s && cur && !g.flat && (g.w < s->w || g.h < s->h)) s = nullptr;  // not representable in it
@@ -2766,7 +2770,10 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
                         break;
                     }
             }
-            if (!j.direct) j.scratch = need, need = (need + g->size + temp_align - 1) & ~(temp_align - 1);
+            if (!j.direct) {
+                const u64 scratch_bytes = g->levels == 1 ? g->ActiveMipSize(0) : g->size;
+                j.scratch = need, need = (need + scratch_bytes + temp_align - 1) & ~(temp_align - 1);
+            }
         } else if (image_copy_via_temp) {
             j.scratch = need, need = (need + g->size + temp_align - 1) & ~(temp_align - 1);
         }
@@ -2824,17 +2831,18 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
                                                {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &info},
                                                {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 4, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &dst}};
                 PushDescriptors(c, VK_PIPELINE_BIND_POINT_COMPUTE, tiling_layout, 0, 3, w);
-                DispatchDetile(c, m, g.mips[m].size, g.bits);
+                DispatchDetile(c, m, g.ActiveMipSize(m), g.bits);
             }
             continue;
         }
         detiled_buf = true;
-        const VkDescriptorBufferInfo in{mirror, g.base, g.size}, out{dst_buf, dst_base + j.scratch, g.size}, info{tables.buf, j.info, sizeof(TilingInfo)};
+        const u64 scratch_bytes = g.levels == 1 ? g.ActiveMipSize(0) : g.size;
+        const VkDescriptorBufferInfo in{mirror, g.base, g.size}, out{dst_buf, dst_base + j.scratch, scratch_bytes}, info{tables.buf, j.info, sizeof(TilingInfo)};
         const VkWriteDescriptorSet w[]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &in},
                                        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &out},
                                        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &info}};
         PushDescriptors(c, VK_PIPELINE_BIND_POINT_COMPUTE, tiling_layout, 0, 3, w);
-        for (u32 m = 0; m < g.levels; ++m) DispatchDetile(c, m, g.mips[m].size, g.bits);
+        for (u32 m = 0; m < g.levels; ++m) DispatchDetile(c, m, g.ActiveMipSize(m), g.bits);
     }
     if (!linear.empty()) vkCmdCopyBuffer(c, mirror, dst_buf, (u32)linear.size(), linear.data());
     if (detiled_buf || !linear.empty())  // one barrier for both ways into `dst_buf`
@@ -2898,7 +2906,7 @@ bool Renderer::Impl::Store(VkCommandBuffer c, GuestTex& g, u32 m) {
                                        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &info}};
         PushDescriptors(c, VK_PIPELINE_BIND_POINT_COMPUTE, tiling_layout, 0, 3, w);
     }
-    DispatchDetile(c, m, l.size, g.bits);
+    DispatchDetile(c, m, g.ActiveMipSize(m), g.bits);
     return true;
 }
 

@@ -551,7 +551,10 @@ struct Renderer::Impl {
         Surface* surf = nullptr;
         VkFormat fmt = VK_FORMAT_UNDEFINED;
         u64 base = 0, size = 0;
-        u32 w = 1, h = 1, d = 1, layers = 1, levels = 1, img_levels = 1, tile = 0, bits = 0, checked = ~0u;
+        u32 w = 1, h = 1, d = 1, layers = 1, guest_layers = 1, levels = 1, img_levels = 1, tile = 0, bits = 0, checked = ~0u;
+        u32 ActiveMipSize(u32 m) const {
+            return guest_layers > layers ? u32(u64(mips[m].size) / guest_layers * layers) : mips[m].size;
+        }
         u32 iw = 1, ih = 1;  // its image's extent
         u64 synced = 0;      // write_seq its contents reflect
         u64 video_serial = 0;
