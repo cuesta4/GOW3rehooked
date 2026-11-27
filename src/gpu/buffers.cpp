@@ -263,15 +263,10 @@ void Renderer::Impl::BindPages(u64 lo, u64 hi) {
         if (word & bit) continue;
         word |= bit;
         if (chunk_used + page > chunk_size) {
-            VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
-            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags, chunk_size, DeviceType(mirror_bits, chunk_size)};
-            VkDeviceMemory m = VK_NULL_HANDLE;
-            if (const VkResult e = vkAllocateMemory(dev, &ai, nullptr, &m); e != VK_SUCCESS) {
+            const VkMemoryRequirements req{chunk_size, page, mirror_bits};
+            const VkDeviceMemory m = Alloc(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
+            if (!m) {
                 word &= ~bit;  // the rest stays without memory (reads zero); the next write there tries again
-                alloc_pressure.store(true, std::memory_order_relaxed);
-                if (!chunk_failed)
-                    chunk_failed = true, Gow3::Log(std::format("Renderer: vkAllocateMemory {} for the guest mirror (type {}, {} MB held)", (int)e,
-                                                               (int)ai.memoryTypeIndex, mirror_chunks.load() >> 20));
                 break;
             }
             chunks.push_back(m), chunk_used = 0, mirror_chunks += chunk_size;
@@ -338,7 +333,7 @@ const u8* Renderer::Impl::Stage(u64 addr, const u8* src, u64 n, u64* hash) {
 // render, so only a VRAM copy stays in front of this frame's draws. The later `copied` signal on that queue covers it.
 void Renderer::Impl::RecordSend(VkCommandBuffer c) {
     if (!use_stage_dev) return;
-    std::vector<VkBufferCopy> copies;
+    static thread_local std::vector<VkBufferCopy> copies;
     auto send_span = [&](std::span<const Pending> src) {
         for (size_t i = 0, j; i < src.size(); i = j) {
             for (j = i; j < src.size() && src[j].chunk == src[i].chunk;) ++j;
@@ -372,7 +367,7 @@ void Renderer::Impl::Send() {
 
 // Staged guest writes -> mirror, recorded at the start of the frame's command buffer: the sent ones from VRAM.
 void Renderer::Impl::Flush(VkCommandBuffer c) {
-    std::vector<VkBufferCopy> copies;
+    static thread_local std::vector<VkBufferCopy> copies;
     if (boom_on) boom_up[slot].clear();
     for (size_t i = 0; i < pending.size();) {
         const u32 chunk = pending[i].chunk;
@@ -411,8 +406,9 @@ void Renderer::Write(std::span<WriteRange> ranges) {
         u64 a, n, h;
         const u8* p;
         WriteRange* w;
-        u64 capture;
-        bool copied = false;
+        bool capture = false;
+        u32 cap_chunk = ~0u;
+        u64 cap_src = 0;
         Impl::BlockHashes* blocks = nullptr;
         u64 previous = 0, hashes[0x1000 / Gpu::PieceHash::kMemoryBlock]{};
         u32 mask = 0, want = 0xFF;  // blocks: changed, offered
@@ -421,7 +417,6 @@ void Renderer::Write(std::span<WriteRange> ranges) {
     static thread_local std::vector<Piece> own;
     std::vector<Piece>& pieces = own;  // the caller's, on every thread
     pieces.clear();
-    u64 capture_size = 0;
     static std::atomic<bool> above_fallback{false};  // logged once, outside debug runs too
     for (WriteRange& w : ranges) {
         const u64 top = d->mirror_size;  // the mirror holds guest addresses below it (32 GB, or 16 GB)
@@ -434,30 +429,16 @@ void Renderer::Write(std::span<WriteRange> ranges) {
             n = std::min<u64>(0x1000 - (a & 0xFFF), end - a);
             const u32 want = w.blocks && n == 0x1000 ? u32(w.blocks[(a - w.addr) >> 15] >> ((a - w.addr) >> 9 & 63) & 0xFF) : 0xFF;
             if (!want) continue;  // no block of the page asked for
-            pieces.push_back({a, n, w.capture ? d->WrittenSlot(a, n) : 0, (const u8*)w.data + (a - w.addr), &w, w.capture ? capture_size : ~0ull});
+            pieces.push_back({a, n, w.capture ? d->WrittenSlot(a, n) : 0, (const u8*)w.data + (a - w.addr), &w, w.capture});
             if (w.capture && n == 0x1000) {
                 auto& b = d->written_blocks[a >> 20];
                 if (!b) b = std::make_unique<Impl::BlockHashes[]>(256);
                 pieces.back().blocks = &b[(a >> 12) & 255], pieces.back().want = want;
             }
-            if (w.capture) capture_size = (capture_size + n + 63) & ~63ull;
-        }
-    }
-    Impl::Pending capture{};
-    u8* captured = nullptr;
-    if (capture_size) {
-        std::scoped_lock lock(d->stage_lock);
-        capture = d->AllocateStage(capture_size);
-        if (capture.chunk != ~0u) {
-            captured = d->stage[capture.chunk].ptr + capture.src;
-        } else {
-            d->Note("staging capture allocation failed");
-            capture_size = 0;
-            for (Piece& q : pieces) q.capture = ~0ull, q.blocks = nullptr;
         }
     }
     // The hashes (0: the frame in flight writes there) on every recording thread, unless this one is recording.
-    const auto& inflight = d->flight.back;
+    const auto& inflight = d->flight.back_ranges;
     const auto changed_blocks = [](u32 mask, auto fn) {
         while (mask) {
             const u32 b = std::countr_zero(mask), n = std::countr_one(mask >> b);
@@ -469,10 +450,15 @@ void Renderer::Write(std::span<WriteRange> ranges) {
     const std::function<void(u32)> hash = [&](u32) {
         RenderProbe::Scope hash_time(RenderProbe::Hash, true);
         alignas(64) u8 snapshot[0x1000];  // reused in this worker's L1; the guest bytes are read only once
-        for (size_t k; (k = next.fetch_add(32, std::memory_order_relaxed)) < pieces.size();)
-            for (Piece& q : std::span(pieces).subspan(k, std::min<size_t>(32, pieces.size() - k))) {
-                if (std::any_of(inflight.begin(), inflight.end(), [&](const VkBufferCopy& c) { return q.a < c.srcOffset + c.size && c.srcOffset < q.a + q.n; })) q.h = 0;
-                else if (q.capture == ~0ull) q.h = Impl::PieceHash(q.p, q.n);
+        static thread_local std::vector<u8> batch_buf;
+        if (batch_buf.size() < 32 * 0x1000) batch_buf.resize(32 * 0x1000);
+        bool any_wc = false;
+        for (size_t k; (k = next.fetch_add(32, std::memory_order_relaxed)) < pieces.size();) {
+            auto batch = std::span(pieces).subspan(k, std::min<size_t>(32, pieces.size() - k));
+            u32 batch_used = 0;
+            for (Piece& q : batch) {
+                if (Impl::OverlapsRanges(inflight, q.a, q.a + q.n)) q.h = 0;
+                else if (!q.capture) q.h = Impl::PieceHash(q.p, q.n);
                 else {
                     q.previous = q.h;
                     if (q.blocks) {
@@ -496,17 +482,44 @@ void Renderer::Write(std::span<WriteRange> ranges) {
                             q.mask |= (u32(~_mm_movemask_pd(_mm_castsi128_pd(_mm_cmpeq_epi64(old, now)))) & 3) << b;
                         }
 #endif
-                        changed_blocks(q.mask, [&](u64 o, u64 n) { std::memcpy(captured + q.capture + o, snapshot + o, n); });
-                        if (!q.mask) q.h = q.previous;
-                        else if (q.h == q.previous) q.h ^= 2;
-                        q.copied = q.mask != 0;
+                        if (q.mask) {
+                            q.cap_src = batch_used, q.cap_chunk = 0;
+                            changed_blocks(q.mask, [&](u64 o, u64 n) {
+                                std::memcpy(batch_buf.data() + batch_used, snapshot + o, n);
+                                batch_used += (u32)n;
+                            });
+                            if (q.h == q.previous) q.h ^= 2;
+                        } else q.h = q.previous;
                     } else {
                         q.h = Gpu::PieceHash::Copy(snapshot, q.p, q.n);
-                        if (q.h != q.previous) std::memcpy(captured + q.capture, snapshot, q.n), q.copied = true;
+                        if (q.h != q.previous) {
+                            q.cap_src = batch_used, q.cap_chunk = 0;
+                            std::memcpy(batch_buf.data() + batch_used, snapshot, q.n);
+                            batch_used += (u32)q.n;
+                        }
                     }
                 }
             }
-        if (capture_size) _mm_sfence();  // publish WC stores before the worker signals completion
+            if (batch_used) {
+                Impl::Pending bp{};
+                u8* dst = nullptr;
+                {
+                    std::scoped_lock lock(d->stage_lock);
+                    bp = d->AllocateStage(batch_used);
+                    if (bp.chunk != ~0u) dst = d->stage[bp.chunk].ptr + bp.src;
+                }
+                if (dst) {
+                    std::memcpy(dst, batch_buf.data(), batch_used);
+                    any_wc = true;
+                    for (Piece& q : batch)
+                        if (q.cap_chunk != ~0u) q.cap_chunk = bp.chunk, q.cap_src += bp.src;
+                } else {
+                    d->Note("staging capture allocation failed");
+                    for (Piece& q : batch) q.cap_chunk = ~0u;
+                }
+            }
+        }
+        if (any_wc) _mm_sfence();  // publish WC stores before the worker signals completion
     };
     if (pieces.size() > 64 && !Impl::in_worker) d->Parallel(hash);
     else hash(0);
@@ -514,31 +527,43 @@ void Renderer::Write(std::span<WriteRange> ranges) {
     for (const Piece& q : pieces) {
         u64* w = q.h ? &d->WrittenSlot(q.a, q.n) : nullptr;
         const bool changed = w && *w != q.h;
+        const bool copied = q.cap_chunk != ~0u;
         // Earlier overlapping writes may have invalidated the block comparisons made by the workers.
-        const bool fused = changed && q.copied && (!q.blocks || q.mask == (1u << std::size(q.hashes)) - 1 ||
-                                                  (*w == q.previous && q.blocks->witness == q.witness));
-        const u64 staged = q.copied ? (q.blocks ? std::popcount(q.mask) * Gpu::PieceHash::kMemoryBlock : q.n) : 0;
+        const bool fused = changed && copied && (!q.blocks || q.mask == (1u << std::size(q.hashes)) - 1 ||
+                                                 (*w == q.previous && q.blocks->witness == q.witness));
+        const u64 staged = copied ? (q.blocks ? std::popcount(q.mask) * Gpu::PieceHash::kMemoryBlock : q.n) : 0;
         RenderProbe::Piece(q.a, q.blocks ? std::popcount(q.want) * Gpu::PieceHash::kMemoryBlock : q.n,
                            !w ? RenderProbe::InFlight : !changed ? RenderProbe::Same : *w ? RenderProbe::Changed : RenderProbe::New, false, fused, staged);
         if (changed) {
             q.w->changed = true;
             const u8* copy;
             if (fused) {
-                std::scoped_lock lock(d->stage_lock);
-                if (q.blocks) {
-                    changed_blocks(q.mask, [&](u64 o, u64 n) { d->QueueStage({q.a + o, n, capture.src + q.capture + o, capture.chunk}); });
-                    q.blocks->witness = q.h;
-                    std::copy(std::begin(q.hashes), std::end(q.hashes), q.blocks->hashes);
-                } else d->QueueStage({q.a, q.n, capture.src + q.capture, capture.chunk});
-                *w = q.h, copy = captured + q.capture;
+                {
+                    std::scoped_lock lock(d->stage_lock);
+                    if (q.blocks) {
+                        u64 packed = q.cap_src;
+                        changed_blocks(q.mask, [&](u64 o, u64 n) { d->QueueStage({q.a + o, n, packed, q.cap_chunk}), packed += n; });
+                        q.blocks->witness = q.h;
+                        std::copy(std::begin(q.hashes), std::end(q.hashes), q.blocks->hashes);
+                    } else d->QueueStage({q.a, q.n, q.cap_src, q.cap_chunk});
+                    *w = q.h;
+                }
+                copy = d->stage[q.cap_chunk].ptr + q.cap_src;
             } else copy = d->Stage(q.a, q.p, q.n, w);
             if (!copy) continue;
             if (!q.blocks && *w != q.h) RenderProbe::Piece(q.a, q.n, RenderProbe::Changed, true);
             if (Impl::boom_on) {
-                const u64 step = q.blocks && copy == captured + q.capture ? Gpu::PieceHash::kMemoryBlock : q.n;
-                for (u64 o = 0; o < q.n; o += step)
-                    if ((step == q.n || (q.mask & (1u << (o / step)))) && std::memcmp(copy + o, q.p + o, step))
-                        d->NoteTear(q.a + o, copy + o, q.p + o, step);
+                if (fused && q.blocks) {
+                    u64 packed = 0;
+                    changed_blocks(q.mask, [&](u64 o, u64 n) {
+                        for (u64 b = 0; b < n; b += Gpu::PieceHash::kMemoryBlock)
+                            if (std::memcmp(copy + packed + b, q.p + o + b, Gpu::PieceHash::kMemoryBlock))
+                                d->NoteTear(q.a + o + b, copy + packed + b, q.p + o + b, Gpu::PieceHash::kMemoryBlock);
+                        packed += n;
+                    });
+                } else if (std::memcmp(copy, q.p, q.n)) {
+                    d->NoteTear(q.a, copy, q.p, q.n);
+                }
             }
             // Part of a page changed: so did the page for Version (its whole piece is staged again at its next offer).
             if (q.n != 0x1000) {
@@ -558,7 +583,7 @@ void Renderer::Write(std::span<WriteRange> ranges) {
 // Live linear readback: the frame's GPU writes, mirror -> host, handed to the caller when the frame retires. With the
 // copy engine's second queue: mirror -> rb_dev here (VRAM), rb_dev -> host there once the frame is done. Returns the bytes.
 u64 Renderer::Impl::RecordReadback(const VkCommandBufferBeginInfo& bi) {
-    back.clear();
+    back.clear(), back_ranges.clear();
     u64 rb_total = 0;
     if (readback)
         for (auto& w : gpu_writes)  // a write left in its image has not reached the mirror (tiled: the CPU does not read it)
@@ -589,6 +614,16 @@ u64 Renderer::Impl::RecordReadback(const VkCommandBufferBeginInfo& bi) {
             back.clear();
             return 0;
         }
+        back_ranges.reserve(back.size());
+        for (const VkBufferCopy& c : back)
+            if (c.size) back_ranges.push_back({c.srcOffset, c.srcOffset + c.size});
+        std::sort(back_ranges.begin(), back_ranges.end());
+        size_t merged_rb = 0;
+        for (auto r : back_ranges)
+            if (merged_rb && r.first <= back_ranges[merged_rb - 1].second)
+                back_ranges[merged_rb - 1].second = std::max(back_ranges[merged_rb - 1].second, r.second);
+            else back_ranges[merged_rb++] = r;
+        back_ranges.resize(merged_rb);
         TempLabel(primary, "readback");  // TEMP perf
         vkCmdCopyBuffer(primary, mirror, (rbq ? rb_dev : rb).buf, (u32)back.size(), back.data());
         TempLabelEnd(primary);  // TEMP perf
@@ -661,6 +696,7 @@ void Renderer::Impl::TrimFrameBuffers() {
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
@@ -696,7 +732,8 @@ const std::unique_ptr<std::atomic<u64>[]> dirty_groups(new std::atomic<u64>[kPag
 std::vector<u64> closed;                      // pages the last frame protected again from `dirty`, sorted (GPU thread)
 struct Live { u64 page; u32 quiet; };         // quiet: frames since its bytes last changed
 std::vector<Live> dynamic;                    // pages offered every frame (GPU thread)
-std::atomic<u32> generation{1};               // bumped on every mapping change: a query racing it may report the old one
+std::atomic<u32> generation{1};               // bumped on every mapping change
+std::shared_mutex map_lock;                   // Forget (exclusive) vs Readable slow path (shared)
 
 Kind KindOf(u64 page) { return Kind(state[page].load(std::memory_order_acquire) & 7); }
 #ifdef _WIN32
@@ -881,6 +918,7 @@ void Protect(const std::vector<u64>& pages) {
 
 // A guest mapping or protection change: the pages are tracked and queried again.
 void Forget(u64 addr, u64 size) {
+    std::unique_lock l(map_lock);
     const u64 p0 = addr / kPage, p1 = std::min((addr + size + kPage - 1) / kPage, kPages);
     for (u64 p = p0; p < p1; ++p)
         if (KindOf(p) != Region) state[p].store(Unknown, std::memory_order_release);
@@ -1103,7 +1141,9 @@ u64 CopyBacking(u64 dst, const void* src, u64 size, bool hash) {
     u64 out_hash = 0;
     for (u64 o = 0; o < size;) {
         const u64 a = dst + o, n = std::min(kBacking - (a & (kBacking - 1)), size - o);
-        u8* p = *backing.find(a / kBacking) + (a & (kBacking - 1));
+        const auto* e = (a >> 40) ? nullptr : backing.find(a / kBacking);
+        if (!e || !*e) return 0;
+        u8* p = *e + (a & (kBacking - 1));
         if (hash && size == n) out_hash = Gpu::PieceHash::Copy(p, s + o, n);
         else std::memcpy(p, s + o, n);
         o += n;
@@ -1111,13 +1151,16 @@ u64 CopyBacking(u64 dst, const void* src, u64 size, bool hash) {
     return out_hash ? out_hash : (hash ? Gpu::PieceHash::Hash(src, size) : 0);
 }
 
+u32 Generation() { return generation.load(std::memory_order_acquire); }
+
 bool Readable(u64 addr, u64 size) {
     if (!size) return true;
     const u64 p0 = addr / kPage, p1 = (addr + size + kPage - 1) / kPage;
     if (p1 <= kPages && All(known.get(), p0, p1)) return All(readable.get(), p0, p1);
-    // Each region queried is learned whole.
-    const u32 gen = generation.load(std::memory_order_acquire);
-    u64 lo = 0, a = addr;
+    // Synchronize against concurrent Forget() before caching host readability bits.
+    std::shared_lock l(map_lock);
+    if (p1 <= kPages && All(known.get(), p0, p1)) return All(readable.get(), p0, p1);
+    u64 a = addr;
     bool ok = true;
     while (ok && a < addr + size) {
 #ifdef _WIN32
@@ -1136,9 +1179,8 @@ bool Readable(u64 addr, u64 size) {
         ok = range.read;
 #endif
         Mark(readable.get(), base / kPage, end / kPage, ok), Mark(known.get(), base / kPage, end / kPage, true);
-        lo = a == addr ? base : lo, a = end;
+        a = end;
     }
-    if (generation.load(std::memory_order_acquire) != gen) Mark(known.get(), lo / kPage, a / kPage, false);  // may be gone
     return ok;
 }
 } // namespace Gow3::GuestMemory

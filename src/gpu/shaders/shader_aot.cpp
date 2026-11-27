@@ -54,10 +54,12 @@ struct KeptFixed { RecipeHead h; u64 key, code_start, fetch_start; u32 file, pat
 u32 SampleClass() { return Aot::sample_log2; }
 
 // `version`: of the rules the kept list comes from (kKeptFormat, kAotPipelineVersion); its keys follow kAotCacheVersion.
-u64 KeptStamp(u64 files_stamp, bool no_storage_read_nofmt, u32 version) {
+u64 KeptStamp(u64 files_stamp, bool no_storage_read_nofmt, u32 version, bool no_float_controls = false) {
     const u64 parts[]{files_stamp, SampleClass(), kAotCacheVersion, version};
-    const u64 h = PieceHash::Stable64(parts, sizeof(parts));
-    return no_storage_read_nofmt ? (h ^ 0x53544F524E4F5244ull) : h;
+    u64 h = PieceHash::Stable64(parts, sizeof(parts));
+    if (no_storage_read_nofmt) h ^= 0x53544F524E4F5244ull;
+    if (no_float_controls) h ^= 0x464C544354524C30ull;
+    return h;
 }
 
 bool LoadKept(const std::filesystem::path& path, u64 stamp, std::vector<Kept>& out) {
@@ -171,12 +173,13 @@ void Renderer::Impl::AotBuild() {
     const auto t0 = std::chrono::steady_clock::now();
     const auto seconds = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
     const bool no_srnf = !caps.storage_image_read_without_format;
+    const bool no_fc = !caps.signed_zero_inf_nan_preserve;
     // The recipes as this GPU's runtime keys them, whichever GPU met them (the release's come from another one).
     std::vector<Recipe> recipes = Recipes::Instance().All();
     // What the recipes met orders the lazy AOT's work: their variants' keys (with the contract's PS variants of the programs
     // they met, added below) and their PS programs' code.
     std::unordered_set<u64> met_keys, met_ps;
-    std::erase_if(recipes, [&](Recipe& r) { return r.Adapt(no_srnf), !met_keys.insert(r.Key()).second; });
+    std::erase_if(recipes, [&](Recipe& r) { return r.Adapt(no_srnf, no_fc), !met_keys.insert(r.Key()).second; });
     for (const Recipe& r : recipes) if (r.h.stage == u8(Gcn::Stage::Pixel)) met_ps.insert(r.h.code_hash);
     const auto note_met = [&](const Recipe& r, u64 key) {
         if (r.h.stage == u8(Gcn::Stage::Pixel) && met_ps.contains(r.h.code_hash)) met_keys.insert(key);
@@ -404,7 +407,7 @@ void Renderer::Impl::AotBuild() {
     const bool need_pl = caps.path != ShaderPath::Objects;
     const auto kept_path = cache.Directory() / (PieceHash::UsesAes() ? "contract-hash2-aes.cache" : "contract-hash2-xxh.cache");
     const auto kept_pl_path = cache.Directory() / (PieceHash::UsesAes() ? "pipeline-contract-hash2-aes.cache" : "pipeline-contract-hash2-xxh.cache");
-    const u64 kept_stamp = KeptStamp(index.stamp, no_srnf, kKeptFormat), kept_pl_stamp = KeptStamp(index.stamp, no_srnf, kAotPipelineVersion);
+    const u64 kept_stamp = KeptStamp(index.stamp, no_srnf, kKeptFormat, no_fc), kept_pl_stamp = KeptStamp(index.stamp, no_srnf, kAotPipelineVersion, no_fc);
     std::vector<Kept> kept;
     std::vector<ContractedPipeline> kept_pipelines;
     std::deque<Parser::Program> kept_code;  // where the code of the variants read from the file lies, for their jobs
@@ -526,7 +529,7 @@ void Renderer::Impl::AotBuild() {
             pl_jobs.push_back({gk, is_wad});
             return 1;
         };
-        for (const GraphicsPipelineKey& r : Recipes::Instance().Pipelines(no_srnf, blend_interlock)) push_pl(r.vs_key, r.ps_key, r.gs_mask, r.state, false);
+        for (const GraphicsPipelineKey& r : Recipes::Instance().Pipelines(no_srnf, blend_interlock, no_fc)) push_pl(r.vs_key, r.ps_key, r.gs_mask, r.state, false);
         // The derived pipelines as this launch builds them: one gated on a PS program waits until the recipes meet its code; the
         // scene's sample count is this launch's.
         size_t gated = 0;

@@ -1378,19 +1378,30 @@ void Gen::Mimg(const Inst& i) {
     }
     const Id level = lod ? fa() : lz ? CF(0.f) : Id(0);
     if (clampv) a_next++;
-    if ((unorm || spec[i.smp].unnormalized) && (kind == 0 || kind == 2)) {
-        Id denom;
-        if (sub) {
-            denom = R(spv::OpConvertSToF, tV2F, tsize);
-        } else if (d1) {
-            const Id sz = ImageSize(img, kind, storage);
-            denom = v2(R(spv::OpConvertSToF, tF32, Extract(tI32, sz, 0)), CF(1.f));
+    if ((unorm || spec[i.smp].unnormalized) && kind <= 2) {
+        if (kind <= 1) {
+            Id denom;
+            if (sub) {
+                denom = R(spv::OpConvertSToF, tV2F, tsize);
+            } else if (d1) {
+                const Id sz = ImageSize(img, kind, storage);
+                denom = v2(R(spv::OpConvertSToF, tF32, Extract(tI32, sz, 0)), CF(1.f));
+            } else {
+                const Id sz = ImageSize(img, kind, storage);
+                denom = R(spv::OpConvertSToF, tV2F, kind == 0 ? sz : R(spv::OpVectorShuffle, tV2I, sz, sz, 0u, 1u));
+            }
+            if (kind == 0) {
+                coords = R(spv::OpFDiv, tV2F, coords, denom);
+            } else {
+                const Id xy = R(spv::OpFDiv, tV2F, R(spv::OpVectorShuffle, tV2F, coords, coords, 0u, 1u), denom);
+                coords = v3(Extract(tF32, xy, 0), Extract(tF32, xy, 1), Extract(tF32, coords, 2));
+            }
         } else {
-            denom = R(spv::OpConvertSToF, kind == 0 ? tV2F : tV3F, ImageSize(img, kind, storage));
+            const Id denom = R(spv::OpConvertSToF, tV3F, ImageSize(img, kind, storage));
+            coords = R(spv::OpFDiv, tV3F, coords, denom);
         }
-        coords = R(spv::OpFDiv, kind == 0 ? tV2F : tV3F, coords, denom);
     }
-    if (sub && !(kind == 1 && (unorm || spec[i.smp].unnormalized))) {  // T# coordinates -> the image's, clamped to the T#'s edge texels
+    if (sub) {  // T# coordinates -> the image's, clamped to the T#'s edge texels
         const Id ts = R(spv::OpConvertSToF, tV2F, tsize), half = R(spv::OpCompositeConstruct, tV2F, CF(0.5f), CF(0.5f)), onev = R(spv::OpCompositeConstruct, tV2F, CF(1.f), CF(1.f));
         const Id lo = R(spv::OpFDiv, tV2F, half, ts), hi = R(spv::OpFSub, tV2F, onev, R(spv::OpFDiv, tV2F, half, ts));
         const Id sc = R(spv::OpFDiv, tV2F, ts, R(spv::OpConvertSToF, tV2F, isize));
@@ -1956,8 +1967,10 @@ bool Gen::Run(std::vector<u32>& words, u64& out_mask) {
     for (int k = 0; k < 3; ++k)
         for (int c = 0; c < 3; ++c)
             if (gImg[k][c].v && !storage_read[k][c]) b.Decorate(gImg[k][c], spv::DecorationNonReadable);
-    b.Capability(spv::CapabilitySignedZeroInfNanPreserve);  // GCN floats keep inf, NaN and -0 (GOW3 multiplies by +inf literals)
-    b.Mode(spv::ExecutionModeSignedZeroInfNanPreserve, {32});
+    if (!in.no_float_controls) {
+        b.Capability(spv::CapabilitySignedZeroInfNanPreserve);  // GCN floats keep inf, NaN and -0 (GOW3 multiplies by +inf literals)
+        b.Mode(spv::ExecutionModeSignedZeroInfNanPreserve, {32});
+    }
     spv::ExecutionModel model = spv::ExecutionModelVertex;
     switch (in.stage) {
     case Stage::Vertex:
