@@ -119,7 +119,9 @@ The game can render at 480p, 720p, 1080p (the PS4 original), 1440p, 1800p or 4K.
 
 ### Image quality
 
-The game's default is 2x MSAA, trilinear texture filtering. You can go up to 4x MSAA or turn it off for better performance. CMAA2 can be used to soften the image. For textures, you can use 4x to 16x anisotropic filtering in place of the original trilinear.
+The game's default is 2x MSAA and trilinear texture filtering. You can go up to 4x MSAA or turn it off for better performance. For textures, you can use 4x to 16x anisotropic filtering in place of the original trilinear.
+
+From the title menu, open **Rehooked → Graphics → Post Effects** to choose CMAA2 (better) or Fast Adaptive AA (faster).
 
 When the game's resolution and your monitor's differ, the image needs to be resized. You can use bilinear scaling (faster) or FSR 1/Lanczos 2 (better).
 
@@ -233,7 +235,7 @@ Defaults are in bold.
 | --- | --- | --- |
 | MSAA | Off, **2x**, 4x | Smooths jagged edges. 2x is the original. 4x is smoother and needs more GPU power and video memory. |
 | Texture Filtering | **Trilinear**, 4x, 8x, 16x | Trilinear is the original. 4x to 16x anisotropic keeps textures sharp at steep angles, at a small GPU cost. |
-| Post Effects | **Off**, CMAA2 | CMAA2 smooths jagged edges after the image is drawn, at a small GPU cost. |
+| Post Effects | **Off**, CMAA2, Fast Adaptive AA | Smooths jagged edges after the image is drawn, before scaling it to the display. |
 | Scaler | **Bilinear**, FSR 1 / Lanczos 2 | How the image is resized to your display. Bilinear is the fastest. FSR 1 (enlarging) and Lanczos 2 (shrinking) keep more detail. |
 
 ### Other
@@ -296,7 +298,7 @@ If you are asked for a more detailed capture, add `--debug=2` to the debug launc
 
 - The [shadPS4](https://github.com/shadps4-emu/shadPS4) team, for the PS4 kernel, system library and loader work the system layer is built on.
 - kvicken, for the original resolution patches, extended here.
-- Third-party components: [SDL3](https://github.com/libsdl-org/SDL), [Dear ImGui](https://github.com/ocornut/imgui), [FFmpeg](https://ffmpeg.org), [AMD FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR), [Intel CMAA2](https://github.com/GameTechDev/CMAA2), [shaderc](https://github.com/google/shaderc) with [glslang](https://github.com/KhronosGroup/glslang) and [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools), [Zydis](https://github.com/zyantific/zydis), [Xbyak](https://github.com/herumi/xbyak), [xxHash](https://github.com/Cyan4973/xxHash), [Zstandard](https://github.com/facebook/zstd), [fmt](https://github.com/fmtlib/fmt), [magic_enum](https://github.com/Neargye/magic_enum), [stb](https://github.com/nothings/stb), [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9) and the [Cinzel](https://github.com/NDISCOVER/Cinzel) typeface.
+- Third-party components: [SDL3](https://github.com/libsdl-org/SDL), [Dear ImGui](https://github.com/ocornut/imgui), [FFmpeg](https://ffmpeg.org), [AMD FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR), [Intel CMAA2](https://github.com/GameTechDev/CMAA2), [Fast Adaptive AA](https://github.com/grebord/Fast-Adaptive-AA), [shaderc](https://github.com/google/shaderc) with [glslang](https://github.com/KhronosGroup/glslang) and [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools), [Zydis](https://github.com/zyantific/zydis), [Xbyak](https://github.com/herumi/xbyak), [xxHash](https://github.com/Cyan4973/xxHash), [Zstandard](https://github.com/facebook/zstd), [fmt](https://github.com/fmtlib/fmt), [magic_enum](https://github.com/Neargye/magic_enum), [stb](https://github.com/nothings/stb), [LibAtrac9](https://github.com/Thealexbarney/LibAtrac9) and the [Cinzel](https://github.com/NDISCOVER/Cinzel) typeface.
 
 ## License
 

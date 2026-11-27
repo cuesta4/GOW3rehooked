@@ -132,12 +132,13 @@ add_custom_command(OUTPUT ${easu_spv}
     COMMAND ${Vulkan_GLSLC_EXECUTABLE} --target-env=vulkan1.3 -O -mfmt=num -I ${easu_dir} ${easu_dir}/easu.comp -o ${easu_spv}
     DEPENDS ${easu_dir}/easu.comp ${easu_dir}/ffx_a.h ${easu_dir}/ffx_fsr1.h VERBATIM)
 target_sources(gow3 PRIVATE ${easu_spv})
-foreach(pass cmaa2_0 cmaa2_1 cmaa2_2 cmaa2_3)
-    set(cmaa_spv ${CMAKE_CURRENT_BINARY_DIR}/${pass}_spv.inc)
-    add_custom_command(OUTPUT ${cmaa_spv}
-        COMMAND ${Vulkan_GLSLC_EXECUTABLE} --target-env=vulkan1.3 -O -mfmt=num ${SRC}/present/cmaa2/${pass}.comp -o ${cmaa_spv}
-        DEPENDS ${SRC}/present/cmaa2/${pass}.comp VERBATIM)
-    target_sources(gow3 PRIVATE ${cmaa_spv})
+foreach(shader cmaa2/cmaa2_0 cmaa2/cmaa2_1 cmaa2/cmaa2_2 cmaa2/cmaa2_3 faaa/faaa)
+    get_filename_component(name ${shader} NAME)
+    set(spv ${CMAKE_CURRENT_BINARY_DIR}/${name}_spv.inc)
+    add_custom_command(OUTPUT ${spv}
+        COMMAND ${Vulkan_GLSLC_EXECUTABLE} --target-env=vulkan1.3 -O -mfmt=num ${SRC}/present/${shader}.comp -o ${spv}
+        DEPENDS ${SRC}/present/${shader}.comp VERBATIM)
+    target_sources(gow3 PRIVATE ${spv})
 endforeach()
 set(ui_font ${SRC}/ui/fonts/NotoSansCJKtc-RehookedSubset.otf)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${ui_font})

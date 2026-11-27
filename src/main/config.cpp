@@ -25,7 +25,7 @@ bool Boolean(std::string_view value, bool& out) {
 
 constexpr std::array<std::string_view, 3> DisplayModes{"windowed", "borderless", "fullscreen"};
 constexpr std::array<std::string_view, 3> VSyncModes{"fifo", "mailbox", "off"};
-constexpr std::array<std::string_view, 2> AntiAliasingModes{"none", "cmaa2"};
+constexpr std::array<std::string_view, 3> AntiAliasingModes{"none", "cmaa2", "faaa"};
 constexpr std::array<std::string_view, 2> ScalingFilters{"bilinear", "fsr1"};
 constexpr std::array<std::string_view, 2> ShaderModes{"sync", "async"};
 constexpr std::array<std::string_view, 2> ShaderMechanisms{"jit", "aot"};

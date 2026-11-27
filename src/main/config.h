@@ -9,7 +9,7 @@
 namespace Gow3 {
 enum class DisplayMode { Windowed, Borderless, Fullscreen };
 enum class VSync { Fifo, Mailbox, Off }; // swapchain present mode
-enum class AntiAliasing { None, Cmaa2 };
+enum class AntiAliasing { None, Cmaa2, Faaa };
 enum class ScalingFilter { Bilinear, Fsr1 };
 enum class ShaderRecompilation { Sync, Async };
 enum class ShaderMechanism { Jit, Aot };

@@ -54,6 +54,8 @@ done
     done
     printf '\n=== Intel CMAA2, Copyright Intel Corporation ===\n\n'
     cat licenses/Apache-2.0.txt
+    printf '\n=== Fast Adaptive AA (based on NVIDIA FXAA 3.11) ===\n\n'
+    cat licenses/Fast-Adaptive-AA.txt
     printf '\n=== AppImage Type 2 runtime ===\n%s\n' 'https://github.com/AppImage/type2-runtime#license'
     if [[ -n "$tag" ]]; then
         printf '\n=== Go standard library ===\n'

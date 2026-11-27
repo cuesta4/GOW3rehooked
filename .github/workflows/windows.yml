@@ -204,6 +204,7 @@ jobs:
             @('stb', 'src/externals/stb/LICENSE'),
             @('AMD FidelityFX Super Resolution 1', 'src/present/fsr/LICENSE.txt'),
             @('Intel CMAA2, Copyright Intel Corporation', 'licenses/Apache-2.0.txt'),
+            @('Fast Adaptive AA (based on NVIDIA FXAA 3.11)', 'licenses/Fast-Adaptive-AA.txt'),
             @('shaderc', "$share/shaderc/copyright"),
             @('glslang', "$share/glslang/copyright"),
             @('SPIRV-Tools', "$share/spirv-tools/copyright"),

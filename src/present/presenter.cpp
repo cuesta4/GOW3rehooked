@@ -30,7 +30,7 @@ using Vulkan::Check;
 struct Scaled { VkImage image{}; VkDeviceMemory memory{}; VkImageView view{}; VkExtent2D size{}; VkFormat format{}; bool in_general{}; };
 struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; VkDeviceSize size{}; };
 struct CmaaState { Scaled edges, heads, output; std::array<Buffer, 5> buffers; };
-struct Frame { VkCommandBuffer cmd; VkFence fence; VkSemaphore acquired; VkImageView game{}, linear{}; VkImage game_image{}; VkFormat game_format{}; std::vector<Scaled> scaled; CmaaState cmaa; bool probed{}; };
+struct Frame { VkCommandBuffer cmd; VkFence fence; VkSemaphore acquired; VkImageView game{}, linear{}; VkImage game_image{}; VkFormat game_format{}; std::vector<Scaled> scaled; CmaaState cmaa; Scaled faaa; bool probed{}; };
 SDL_Window* window;
 VkDevice device;
 VkQueue queue;
@@ -78,10 +78,11 @@ VkPipelineLayout pipeline_layout;
 VkPipeline pipeline;
 VkPipeline probe_pipeline;
 VkQueryPool probe_queries;
-VkDescriptorSetLayout easu_set;
-VkPipelineLayout easu_layout;
+VkDescriptorSetLayout filter_set;
+VkPipelineLayout filter_layout;
 VkPipeline easu_pipeline;
 VkPipeline lanczos_h_pipeline;
+VkPipeline faaa_pipeline;
 VkDescriptorSetLayout cmaa_set;
 VkPipelineLayout cmaa_layout;
 std::array<VkPipeline, 4> cmaa_pipelines;
@@ -102,6 +103,9 @@ constexpr u32 cmaa2_spv[]{
 };
 constexpr u32 cmaa3_spv[]{
 #include "cmaa2_3_spv.inc"
+};
+constexpr u32 faaa_spv[]{
+#include "faaa_spv.inc"
 };
 
 u32 DeviceMemoryType(u32 bits) {
@@ -126,16 +130,16 @@ void ResizeScaled(Scaled& s, VkExtent2D size, VkFormat image_format = VK_FORMAT_
         .format = image_format, .extent = {size.width, size.height, 1}, .mipLevels = 1, .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-    Check(vkCreateImage(device, &info, nullptr, &s.image), "Create FSR image");
+    Check(vkCreateImage(device, &info, nullptr, &s.image), "Create presentation filter image");
     VkMemoryRequirements req{};
     vkGetImageMemoryRequirements(device, s.image, &req);
     const VkMemoryAllocateInfo allocation{.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = req.size, .memoryTypeIndex = DeviceMemoryType(req.memoryTypeBits)};
-    Check(vkAllocateMemory(device, &allocation, nullptr, &s.memory), "Allocate FSR image");
-    Check(vkBindImageMemory(device, s.image, s.memory, 0), "Bind FSR image");
+    Check(vkAllocateMemory(device, &allocation, nullptr, &s.memory), "Allocate presentation filter image");
+    Check(vkBindImageMemory(device, s.image, s.memory, 0), "Bind presentation filter image");
     const VkImageViewCreateInfo view{.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = s.image,
         .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = info.format,
         .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-    Check(vkCreateImageView(device, &view, nullptr, &s.view), "Create FSR image view");
+    Check(vkCreateImageView(device, &view, nullptr, &s.view), "Create presentation filter image view");
     s.size = size, s.format = image_format;
 }
 
@@ -238,6 +242,33 @@ VkImageView ApplyCmaa(Frame& frame, VkExtent2D size) {
     return c.output.view;
 }
 
+void BindFilter(VkCommandBuffer cmd, VkPipeline filter, VkImageView source, Scaled& image) {
+    if (!image.in_general) {
+        image.in_general = true;
+        const VkImageMemoryBarrier2 transition{.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL, .image = image.image,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        const VkDependencyInfo before{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &transition};
+        vkCmdPipelineBarrier2(cmd, &before);
+    }
+    const VkDescriptorImageInfo desc[2]{{sampler, source, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, image.view, VK_IMAGE_LAYOUT_GENERAL}};
+    const VkWriteDescriptorSet writes[2]{
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &desc[0]},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &desc[1]}};
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, filter);
+    push_descriptor(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, filter_layout, 0, 2, writes);
+}
+
+VkImageView ApplyFaaa(Frame& frame, VkExtent2D size) {
+    ResizeScaled(frame.faaa, size);
+    // FAAA uses encoded luma, so read the same UNORM view as the scalers.
+    BindFilter(frame.cmd, faaa_pipeline, frame.game, frame.faaa);
+    vkCmdDispatch(frame.cmd, (size.width + 15) / 16, (size.height + 15) / 16, 1);
+    ComputeBarrier(frame.cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT);
+    return frame.faaa.view;
+}
+
 VkImageView Upscale(Frame& frame, VkImageView source, VkExtent2D input, VkExtent2D output) {
     u32 stage = 0;
     for (; input.width < output.width || input.height < output.height; ++stage) {
@@ -245,25 +276,11 @@ VkImageView Upscale(Frame& frame, VkImageView source, VkExtent2D input, VkExtent
         const VkExtent2D next{std::min(output.width, input.width * 2), std::min(output.height, input.height * 2)};
         auto& image = frame.scaled[stage];
         ResizeScaled(image, next);
-        if (!image.in_general) {
-            image.in_general = true;
-            const VkImageMemoryBarrier2 transition{.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-                .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL, .image = image.image,
-                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-            const VkDependencyInfo before{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &transition};
-            vkCmdPipelineBarrier2(frame.cmd, &before);
-        }
-        const VkDescriptorImageInfo desc[2]{{sampler, source, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, image.view, VK_IMAGE_LAYOUT_GENERAL}};
-        const VkWriteDescriptorSet writes[2]{
-            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &desc[0]},
-            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &desc[1]}};
+        BindFilter(frame.cmd, easu_pipeline, source, image);
         const float x = float(input.width), y = float(input.height), ox = float(next.width), oy = float(next.height);
         const float constants[16]{x / ox, y / oy, .5f * x / ox - .5f, .5f * y / oy - .5f,
                                   1.f / x, 1.f / y, 1.f / x, -1.f / y, -1.f / x, 2.f / y, 1.f / x, 2.f / y, 0.f, 4.f / y, 0.f, 0.f};
-        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, easu_pipeline);
-        push_descriptor(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, easu_layout, 0, 2, writes);
-        vkCmdPushConstants(frame.cmd, easu_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants);
+        vkCmdPushConstants(frame.cmd, filter_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants);
         vkCmdDispatch(frame.cmd, (next.width + 15) / 16, (next.height + 15) / 16, 1);
         const bool more = next.width < output.width || next.height < output.height;
         const VkMemoryBarrier2 memory{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
@@ -285,23 +302,9 @@ VkImageView DownscaleX(Frame& frame, VkImageView source, VkExtent2D input, u32 o
     frame.scaled.resize(1);
     auto& image = frame.scaled[0];
     ResizeScaled(image, {out_width, input.height}, VK_FORMAT_R16G16B16A16_SFLOAT);
-    if (!image.in_general) {
-        image.in_general = true;
-        const VkImageMemoryBarrier2 transition{.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL, .image = image.image,
-            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-        const VkDependencyInfo before{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &transition};
-        vkCmdPipelineBarrier2(frame.cmd, &before);
-    }
-    const VkDescriptorImageInfo desc[2]{{sampler, source, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, image.view, VK_IMAGE_LAYOUT_GENERAL}};
-    const VkWriteDescriptorSet writes[2]{
-        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &desc[0]},
-        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &desc[1]}};
+    BindFilter(frame.cmd, lanczos_h_pipeline, source, image);
     const int params[3]{int(input.width), int(out_width), int(input.height)};
-    vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, lanczos_h_pipeline);
-    push_descriptor(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, easu_layout, 0, 2, writes);
-    vkCmdPushConstants(frame.cmd, easu_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(params), params);
+    vkCmdPushConstants(frame.cmd, filter_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(params), params);
     vkCmdDispatch(frame.cmd, (out_width + 15) / 16, (input.height + 15) / 16, 1);
     const VkMemoryBarrier2 memory{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
         .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
@@ -491,7 +494,7 @@ void Draw(s64 latch, u64 address, bool bgra, u64 guest_frame) {
     if (probe) vkCmdResetQueryPool(frame.cmd, probe_queries, slot, 1);
     // One barrier: the swapchain image (acquired at the color output stage) to a render target, the renderer's earlier
     // writes to the display buffer (same queue) visible to the pass's texture reads, and the previous use of this frame's
-    // CMAA2 state (storage) ordered before this one.
+    // presentation filter state (storage) ordered before this one.
     constexpr VkPipelineStageFlags2 written = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
                                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
     const VkMemoryBarrier2 memory{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = written,
@@ -508,6 +511,7 @@ void Draw(s64 latch, u64 address, bool bgra, u64 guest_frame) {
     vkCmdPipelineBarrier2(frame.cmd, &before);
     VkImageView source = frame.game;
     if (shown && frame.linear) source = ApplyCmaa(frame, input);
+    else if (shown && faaa_pipeline) source = ApplyFaaa(frame, input);
     if (shown && scaling == ScalingFilter::Fsr1 && area.extent.width >= input.width && area.extent.height >= input.height &&
         (area.extent.width > input.width || area.extent.height > input.height)) {
         source = Upscale(frame, source, input, area.extent);
@@ -681,21 +685,25 @@ void main() { color = vec4(pow(max(filtered(uv).rgb, 0.0), vec3(gamma)), 1.0); }
     Check(vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout), "Create presentation pipeline layout");
     push_descriptor = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR"));
     if (!push_descriptor) throw std::runtime_error("vkCmdPushDescriptorSetKHR is missing");
-    if (config.scaling_filter == ScalingFilter::Fsr1) {
+    if (config.scaling_filter == ScalingFilter::Fsr1 || config.anti_aliasing == AntiAliasing::Faaa) {
         const VkDescriptorSetLayoutBinding bindings[2]{
             {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT},
             {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT}};
         const VkDescriptorSetLayoutCreateInfo set{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR, .bindingCount = 2, .pBindings = bindings};
-        Check(vkCreateDescriptorSetLayout(device, &set, nullptr, &easu_set), "Create FSR descriptor layout");
+        Check(vkCreateDescriptorSetLayout(device, &set, nullptr, &filter_set), "Create presentation filter descriptor layout");
         const VkPushConstantRange constants{VK_SHADER_STAGE_COMPUTE_BIT, 0, 64};
-        const VkPipelineLayoutCreateInfo layout{.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .setLayoutCount = 1, .pSetLayouts = &easu_set, .pushConstantRangeCount = 1, .pPushConstantRanges = &constants};
-        Check(vkCreatePipelineLayout(device, &layout, nullptr, &easu_layout), "Create FSR pipeline layout");
-        easu_pipeline = CreateCompute(easu_spv, easu_layout);
+        VkPipelineLayoutCreateInfo layout{.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .setLayoutCount = 1, .pSetLayouts = &filter_set};
+        if (config.scaling_filter == ScalingFilter::Fsr1) layout.pushConstantRangeCount = 1, layout.pPushConstantRanges = &constants;
+        Check(vkCreatePipelineLayout(device, &layout, nullptr, &filter_layout), "Create presentation filter pipeline layout");
+    }
+    if (config.anti_aliasing == AntiAliasing::Faaa) faaa_pipeline = CreateCompute(faaa_spv, filter_layout);
+    if (config.scaling_filter == ScalingFilter::Fsr1) {
+        easu_pipeline = CreateCompute(easu_spv, filter_layout);
         const auto lh_spirv = compiler.Spirv(lanczos_h_compute, shaderc_compute_shader, error);
         if (lh_spirv.empty()) throw std::runtime_error("Presentation Lanczos-H shader: " + error);
-        lanczos_h_pipeline = CreateCompute(lh_spirv, easu_layout);
+        lanczos_h_pipeline = CreateCompute(lh_spirv, filter_layout);
     }
     if (config.anti_aliasing == AntiAliasing::Cmaa2) {
         std::array<VkDescriptorSetLayoutBinding, 9> bindings{};

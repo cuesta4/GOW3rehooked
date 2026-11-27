@@ -1,0 +1,80 @@
+// SPDX-FileCopyrightText: Copyright 2026 Germán Rebord
+// SPDX-License-Identifier: MIT
+// Adapted from https://github.com/grebord/Fast-Adaptive-AA/blob/70f53136de09a7f2b48e8c9a046e0dcedba57bd9/FAAA.fx
+// Based on NVIDIA FXAA 3.11 by Timothy Lottes, Copyright (c) 2010, 2011 NVIDIA Corporation.
+// See licenses/Fast-Adaptive-AA.txt for both notices.
+
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(set = 0, binding = 1, rgba8) writeonly uniform image2D output_image;
+
+const vec3 luma_weights = vec3(0.299, 0.587, 0.114);
+// Upstream defaults for edge threshold and quality (both 5).
+const float edge_threshold = (10.0 - 5.0) * 0.0625;
+const float search_steps[] = {1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0};
+
+float sample_luma(vec2 uv) {
+    return dot(textureLod(source, uv, 0.0).rgb, luma_weights);
+}
+
+vec3 filter_pixel(vec2 uv, vec2 texel_size, vec3 color) {
+    float se = dot(textureLodOffset(source, uv, 0.0, ivec2(1, 1)).rgb, luma_weights);
+    float nw = dot(textureLodOffset(source, uv, 0.0, ivec2(-1, -1)).rgb, luma_weights);
+    float sw = dot(textureLodOffset(source, uv, 0.0, ivec2(-1, 1)).rgb, luma_weights);
+    float ne = dot(textureLodOffset(source, uv, 0.0, ivec2(1, -1)).rgb, luma_weights);
+    float sw_ne = sw - ne, se_nw = se - nw;
+    float horizontal = abs(sw_ne + se_nw), vertical = abs(sw_ne - se_nw);
+    float local_threshold = edge_threshold * (0.5 * max(max(sw, se), max(ne, nw)) + 0.5);
+    if (abs(horizontal - vertical) < local_threshold) return color;
+
+    bool horizontal_span = horizontal > vertical;
+    vec2 normal = horizontal_span ? vec2(0.0, texel_size.y) : vec2(texel_size.x, 0.0);
+    vec2 tangent = texel_size - normal;
+    float center = dot(color, luma_weights);
+    float negative = sample_luma(uv - normal), positive = sample_luma(uv + normal);
+    bool pair_negative = abs(negative - center) > abs(positive - center);
+    float neighbor = pair_negative ? negative : positive;
+    if (pair_negative) normal = -normal;
+    float midpoint = (center + neighbor) * 0.5;
+    float gradient = abs(neighbor - center) * 0.25;
+
+    vec2 edge = uv + normal * 0.5;
+    vec2 end_negative = edge - tangent * search_steps[0], end_positive = edge + tangent * search_steps[0];
+    float delta_negative = sample_luma(end_negative) - midpoint;
+    float delta_positive = sample_luma(end_positive) - midpoint;
+    bool done_negative = abs(delta_negative) > gradient, done_positive = abs(delta_positive) > gradient;
+    for (int i = 1; i < search_steps.length() && !(done_negative && done_positive); ++i) {
+        if (!done_positive) {
+            end_positive += tangent * search_steps[i];
+            delta_positive = sample_luma(end_positive) - midpoint;
+            done_positive = abs(delta_positive) > gradient;
+        }
+        if (!done_negative) {
+            end_negative -= tangent * search_steps[i];
+            delta_negative = sample_luma(end_negative) - midpoint;
+            done_negative = abs(delta_negative) > gradient;
+        }
+    }
+
+    float distance_negative = horizontal_span ? uv.x - end_negative.x : uv.y - end_negative.y;
+    float distance_positive = horizontal_span ? end_positive.x - uv.x : end_positive.y - uv.y;
+    bool closer_negative = distance_negative < distance_positive;
+    float end_delta = closer_negative ? delta_negative : delta_positive;
+    float distance_to_end = closer_negative ? distance_negative : distance_positive;
+    float offset = 0.5 - distance_to_end / (distance_negative + distance_positive);
+    if (offset <= 0.0 || (end_delta < 0.0) == (center < midpoint)) return color;
+    return textureLod(source, uv + normal * offset, 0.0).rgb;
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(output_image);
+    if (any(greaterThanEqual(pixel, size))) return;
+
+    vec2 texel_size = 1.0 / vec2(size);
+    vec2 uv = (vec2(pixel) + 0.5) * texel_size;
+    vec4 color = texelFetch(source, pixel, 0);
+    imageStore(output_image, pixel, vec4(filter_pixel(uv, texel_size, color.rgb), color.a));
+}
