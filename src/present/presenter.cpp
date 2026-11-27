@@ -81,6 +81,7 @@ VkQueryPool probe_queries;
 VkDescriptorSetLayout easu_set;
 VkPipelineLayout easu_layout;
 VkPipeline easu_pipeline;
+VkPipeline lanczos_h_pipeline;
 VkDescriptorSetLayout cmaa_set;
 VkPipelineLayout cmaa_layout;
 std::array<VkPipeline, 4> cmaa_pipelines;
@@ -276,6 +277,38 @@ VkImageView Upscale(Frame& frame, VkImageView source, VkExtent2D input, VkExtent
     for (size_t i = stage; i < frame.scaled.size(); ++i) FreeScaled(frame.scaled[i]);
     frame.scaled.resize(stage);
     return source;
+}
+
+VkImageView DownscaleX(Frame& frame, VkImageView source, VkExtent2D input, u32 out_width) {
+    if (frame.scaled.empty()) frame.scaled.emplace_back();
+    for (size_t i = 1; i < frame.scaled.size(); ++i) FreeScaled(frame.scaled[i]);
+    frame.scaled.resize(1);
+    auto& image = frame.scaled[0];
+    ResizeScaled(image, {out_width, input.height}, VK_FORMAT_R16G16B16A16_SFLOAT);
+    if (!image.in_general) {
+        image.in_general = true;
+        const VkImageMemoryBarrier2 transition{.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL, .image = image.image,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        const VkDependencyInfo before{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &transition};
+        vkCmdPipelineBarrier2(frame.cmd, &before);
+    }
+    const VkDescriptorImageInfo desc[2]{{sampler, source, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, image.view, VK_IMAGE_LAYOUT_GENERAL}};
+    const VkWriteDescriptorSet writes[2]{
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &desc[0]},
+        {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &desc[1]}};
+    const int params[3]{int(input.width), int(out_width), int(input.height)};
+    vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, lanczos_h_pipeline);
+    push_descriptor(frame.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, easu_layout, 0, 2, writes);
+    vkCmdPushConstants(frame.cmd, easu_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(params), params);
+    vkCmdDispatch(frame.cmd, (out_width + 15) / 16, (input.height + 15) / 16, 1);
+    const VkMemoryBarrier2 memory{.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT};
+    const VkDependencyInfo after{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &memory};
+    vkCmdPipelineBarrier2(frame.cmd, &after);
+    return image.view;
 }
 
 // The sRGB (srgb) or UNORM sibling of an 8-bit format, or UNDEFINED. sRGB display buffers are sampled through the UNORM view,
@@ -478,6 +511,8 @@ void Draw(s64 latch, u64 address, bool bgra, u64 guest_frame) {
     if (shown && scaling == ScalingFilter::Fsr1 && area.extent.width >= input.width && area.extent.height >= input.height &&
         (area.extent.width > input.width || area.extent.height > input.height)) {
         source = Upscale(frame, source, input, area.extent);
+    } else if (shown && scaling == ScalingFilter::Fsr1 && area.extent.width < input.width) {
+        source = DownscaleX(frame, source, input, area.extent.width);
     } else if (!frame.scaled.empty()) {
         for (auto& s : frame.scaled) FreeScaled(s);
         frame.scaled.clear();
@@ -570,22 +605,48 @@ float weight(float x) {
 }
 vec4 filtered(vec2 uv) {
     ivec2 size = textureSize(game, 0);
-    vec2 ratio = max(fwidth(uv) * vec2(size), vec2(1.0));
-    if (max(ratio.x, ratio.y) <= 1.0001) return texture(game, uv);
-    vec2 pos = uv * vec2(size) - 0.5;
-    ivec2 center = ivec2(floor(pos));
-    ivec2 radius = ivec2(ceil(2.0 * ratio));
+    float ratio = max(fwidth(uv.y) * float(size.y), 1.0);
+    if (ratio <= 1.0001) return texture(game, uv);
+    float pos = uv.y * float(size.y) - 0.5;
+    int center = int(floor(pos));
+    int radius = int(ceil(2.0 * ratio));
     vec4 sum = vec4(0.0);
     float total = 0.0;
-    for (int y = -radius.y; y <= radius.y; ++y) {
-        float wy = weight((float(center.y + y) - pos.y) / ratio.y);
-        for (int x = -radius.x; x <= radius.x; ++x) {
-            float w = wy * weight((float(center.x + x) - pos.x) / ratio.x);
-            sum += texelFetch(game, clamp(center + ivec2(x, y), ivec2(0), size - 1), 0) * w;
-            total += w;
-        }
+    for (int y = -radius; y <= radius; ++y) {
+        float w = weight((float(center + y) - pos) / ratio);
+        float vy = (float(clamp(center + y, 0, size.y - 1)) + 0.5) / float(size.y);
+        sum += texture(game, vec2(uv.x, vy)) * w;
+        total += w;
     }
     return sum / total;
+})";
+    static constexpr const char* lanczos_h_compute = R"(#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D src_tex;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D dst_img;
+layout(push_constant) uniform Params { int in_w; int out_w; int height; };
+float weight(float x) {
+    x = abs(x);
+    if (x < 0.00001) return 1.0;
+    if (x >= 2.0) return 0.0;
+    float p = 3.141592653589793 * x;
+    return sin(p) * sin(p * 0.5) / (p * p * 0.5);
+}
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= out_w || p.y >= height) return;
+    float ratio = float(in_w) / float(out_w);
+    float pos = (float(p.x) + 0.5) * ratio - 0.5;
+    int center = int(floor(pos));
+    int radius = int(ceil(2.0 * ratio));
+    vec4 sum = vec4(0.0);
+    float total = 0.0;
+    for (int x = -radius; x <= radius; ++x) {
+        float w = weight((float(center + x) - pos) / ratio);
+        sum += texelFetch(src_tex, ivec2(clamp(center + x, 0, in_w - 1), p.y), 0) * w;
+        total += w;
+    }
+    imageStore(dst_img, p, sum / total);
 })";
     const std::string fragment = std::string(R"(#version 450
 layout(set = 0, binding = 0) uniform sampler2D game;
@@ -632,6 +693,9 @@ void main() { color = vec4(pow(max(filtered(uv).rgb, 0.0), vec3(gamma)), 1.0); }
             .setLayoutCount = 1, .pSetLayouts = &easu_set, .pushConstantRangeCount = 1, .pPushConstantRanges = &constants};
         Check(vkCreatePipelineLayout(device, &layout, nullptr, &easu_layout), "Create FSR pipeline layout");
         easu_pipeline = CreateCompute(easu_spv, easu_layout);
+        const auto lh_spirv = compiler.Spirv(lanczos_h_compute, shaderc_compute_shader, error);
+        if (lh_spirv.empty()) throw std::runtime_error("Presentation Lanczos-H shader: " + error);
+        lanczos_h_pipeline = CreateCompute(lh_spirv, easu_layout);
     }
     if (config.anti_aliasing == AntiAliasing::Cmaa2) {
         std::array<VkDescriptorSetLayoutBinding, 9> bindings{};
