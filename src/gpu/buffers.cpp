@@ -661,6 +661,7 @@ void Renderer::Impl::TrimFrameBuffers() {
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
@@ -696,7 +697,8 @@ const std::unique_ptr<std::atomic<u64>[]> dirty_groups(new std::atomic<u64>[kPag
 std::vector<u64> closed;                      // pages the last frame protected again from `dirty`, sorted (GPU thread)
 struct Live { u64 page; u32 quiet; };         // quiet: frames since its bytes last changed
 std::vector<Live> dynamic;                    // pages offered every frame (GPU thread)
-std::atomic<u32> generation{1};               // bumped on every mapping change: a query racing it may report the old one
+std::atomic<u32> generation{1};               // bumped on every mapping change
+std::shared_mutex map_lock;                   // Forget (exclusive) vs Readable slow path (shared)
 
 Kind KindOf(u64 page) { return Kind(state[page].load(std::memory_order_acquire) & 7); }
 #ifdef _WIN32
@@ -881,6 +883,7 @@ void Protect(const std::vector<u64>& pages) {
 
 // A guest mapping or protection change: the pages are tracked and queried again.
 void Forget(u64 addr, u64 size) {
+    std::unique_lock l(map_lock);
     const u64 p0 = addr / kPage, p1 = std::min((addr + size + kPage - 1) / kPage, kPages);
     for (u64 p = p0; p < p1; ++p)
         if (KindOf(p) != Region) state[p].store(Unknown, std::memory_order_release);
@@ -1111,13 +1114,16 @@ u64 CopyBacking(u64 dst, const void* src, u64 size, bool hash) {
     return out_hash ? out_hash : (hash ? Gpu::PieceHash::Hash(src, size) : 0);
 }
 
+u32 Generation() { return generation.load(std::memory_order_acquire); }
+
 bool Readable(u64 addr, u64 size) {
     if (!size) return true;
     const u64 p0 = addr / kPage, p1 = (addr + size + kPage - 1) / kPage;
     if (p1 <= kPages && All(known.get(), p0, p1)) return All(readable.get(), p0, p1);
-    // Each region queried is learned whole.
-    const u32 gen = generation.load(std::memory_order_acquire);
-    u64 lo = 0, a = addr;
+    // Synchronize against concurrent Forget() before caching host readability bits.
+    std::shared_lock l(map_lock);
+    if (p1 <= kPages && All(known.get(), p0, p1)) return All(readable.get(), p0, p1);
+    u64 a = addr;
     bool ok = true;
     while (ok && a < addr + size) {
 #ifdef _WIN32
@@ -1136,9 +1142,8 @@ bool Readable(u64 addr, u64 size) {
         ok = range.read;
 #endif
         Mark(readable.get(), base / kPage, end / kPage, ok), Mark(known.get(), base / kPage, end / kPage, true);
-        lo = a == addr ? base : lo, a = end;
+        a = end;
     }
-    if (generation.load(std::memory_order_acquire) != gen) Mark(known.get(), lo / kPage, a / kPage, false);  // may be gone
     return ok;
 }
 } // namespace Gow3::GuestMemory

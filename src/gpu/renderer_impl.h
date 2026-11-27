@@ -774,6 +774,7 @@ struct Renderer::Impl {
     }
     static inline thread_local Flat<ProgMemo> prog_memo;   // program address | stage -> this frame's code, hash, fetch SGPR
     static inline thread_local Flat<ProgMemo> fetch_memo;  // fetch shader address -> this frame's code and hash
+    static inline thread_local u32 prog_memo_gen = ~0u;    // GuestMemory::Generation() when prog_memo/fetch_memo were populated
     std::unordered_map<u64, ShaderRef> rect_gs;            // VS output mask -> rect list geometry shader
     ShaderRef clear_rect_ref{};                            // the SDK clear's four strip vertices
     bool HasClearRectVs() const { return bool(clear_rect_ref); }

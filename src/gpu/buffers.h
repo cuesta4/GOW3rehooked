@@ -25,4 +25,5 @@ char PageKind(u64 addr);                              // U unknown, C clean, D d
 bool AllUnknown(u64 lo, u64 hi);                      // every 4 KB page in [lo, hi) is Unknown
 bool HasBacking(u64 lo, u64 hi);                      // every 16 KB backing page in [lo, hi) has a physical alias
 u64 CopyBacking(u64 dst, const void* src, u64 size, bool hash = false);  // write via physical alias (caller verified HasBacking & Readable)
+u32 Generation();                                     // bumped on every mapping/protection Forget
 } // namespace Gow3::GuestMemory
