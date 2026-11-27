@@ -2906,14 +2906,13 @@ void Renderer::Impl::Upload(VkCommandBuffer c, std::vector<GuestTex*>& list, Buf
         if (j.direct) continue;
         if (j.scratch != ~0ull && !dst_buf) continue;
         GuestTex& g = *j.g;
-        std::vector<VkBufferImageCopy> regions;
-        regions.reserve(g.img_levels);
+        VkBufferImageCopy regions[std::size(g.mips)];
         for (u32 m = 0; m < g.img_levels; ++m)
-            regions.push_back({(j.scratch == ~0ull ? g.base : dst_base + j.scratch) + g.mips[m].offset, g.mips[m].pitch, g.mips[m].height,
-                               {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, g.layers},
-                               {},
-                               {std::max(g.w >> m, 1u), std::max(g.h >> m, 1u), std::max(g.d >> m, 1u)}});
-        vkCmdCopyBufferToImage(c, j.scratch == ~0ull ? mirror : dst_buf, g.t.img, VK_IMAGE_LAYOUT_GENERAL, (u32)regions.size(), regions.data());
+            regions[m] = {(j.scratch == ~0ull ? g.base : dst_base + j.scratch) + g.mips[m].offset, g.mips[m].pitch, g.mips[m].height,
+                          {VK_IMAGE_ASPECT_COLOR_BIT, m, 0, g.layers},
+                          {},
+                          {std::max(g.w >> m, 1u), std::max(g.h >> m, 1u), std::max(g.d >> m, 1u)}};
+        vkCmdCopyBufferToImage(c, j.scratch == ~0ull ? mirror : dst_buf, g.t.img, VK_IMAGE_LAYOUT_GENERAL, g.img_levels, regions);
     }
     Barrier(c, frag);
 }

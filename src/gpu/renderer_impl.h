@@ -858,7 +858,7 @@ struct Renderer::Impl {
         bool rect = false;
     };
     static thread_local Prepared prep;  // Shader's, reused (its vectors keep their capacity)
-    static inline thread_local std::vector<u32> vs_table, ps_table;  // Draw's, reused
+    static inline thread_local std::vector<u32> vs_table, ps_table, cs_table;  // Draw/Dispatch tables, reused
     static constexpr u32 kInputs = 512;
     static inline thread_local u32 inputs[kInputs];                  // Shader's: what makes its variant and slot elements
     static inline thread_local std::vector<MemoTex> slot_used;       // Shader's: each slot's, for Recent
@@ -1057,6 +1057,7 @@ struct Renderer::Impl {
     bool query_open = false;
     std::unordered_map<u64, u32> mesh;
     u32 mesh_copied = kRays;
+    u32 slot_rays[2]{0, 0}, slot_mesh[2]{kRays, kRays};
     Buffer cond;
     u64 QueryBlock(const u32* b) const {  // the address an EVENT_WRITE dumps to when the CPU reads it, else 0
         const u64 a = ((u64)b[1] | (u64)(b[2] & 0xFFFF) << 32) & ~7ull;
@@ -1147,7 +1148,7 @@ struct Renderer::Impl {
 
     // Graphics dynamic state recorded in the current command buffer: Draw emits only what changed (reset per Submit).
     struct DynState {
-        bool valid = false, neg_one = false;
+        bool valid = false, neg_one = false, bias_set = false, stencil_set = false;
         bool pushed = false;  // `push` holds the push constants (another layout's push clears it)
         Push push{};
         VkPipeline pipeline = VK_NULL_HANDLE;

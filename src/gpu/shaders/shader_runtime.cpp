@@ -361,7 +361,7 @@ ShaderRef Renderer::Impl::Translated(Gcn::Stage stage, u64 prog, const CpuRead& 
         bool own = false;
         {
             std::unique_lock lock(prog_lock);
-            if (found()) return shaders.find(key)->second;
+            if (found()) return memo[key] = {shaders.find(key)->second, out_mask}, shaders.find(key)->second;
             auto [it, fresh] = compiling.try_emplace(key);
             if (fresh) it->second = built ? here.get_future().share() : Async(stage, prog, p, true), own = built;
             f = it->second;
@@ -378,14 +378,14 @@ ShaderRef Renderer::Impl::Translated(Gcn::Stage stage, u64 prog, const CpuRead& 
             const ShaderRef cr = c.Ref(key);
             if (cr && cr != shaders.find(key)->second) DestroyShaderRef(cr);
         }
-        return shaders.find(key)->second;
+        return memo[key] = {shaders.find(key)->second, out_mask}, shaders.find(key)->second;
     }
     compiling.erase(key);
     if (stage == Gcn::Stage::Vertex) vs_outputs[key] = out_mask = c.out_mask;
     Count(stats.shaders);
     const ShaderRef ref = c.Ref(key);
     if (!c.Ready(caps.path, stage)) Count(stats.shader_fail), Note(std::format("shader {:x} stage {}: {}", prog, (int)stage, c.err.substr(0, 300)));
-    return shaders[key] = ref;
+    return memo[key] = {ref, out_mask}, shaders[key] = ref;
 }
 
 Renderer::Impl::ProgMemo& Renderer::Impl::RefreshProgMemo(Gcn::Stage stage, u64 prog, const CpuRead& cpu) {

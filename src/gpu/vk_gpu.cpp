@@ -268,6 +268,7 @@ bool Renderer::Impl::Setup(std::string& error) {
     }
     const VkQueryPoolCreateInfo oqi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, nullptr, 0, VK_QUERY_TYPE_OCCLUSION, 2 * kQueries};
     vkCreateQueryPool(dev, &oqi, nullptr, &query_pool);
+    vkResetQueryPool(dev, query_pool, 0, 2 * kQueries);
     cond = MakeBuffer(2 * kQueries * 4, VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, false, "cond");
     if (!cond.buf) return error = "occlusion query buffer allocation failed", false;
 
@@ -922,8 +923,11 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         vkCmdSetPrimitiveTopology(cmd, topo);
         vkCmdSetPrimitiveRestartEnable(cmd, raster[7]);
     }
-    const float bias[3]{F(ctx[0x2E1]), F(ctx[0x2DF]), F(ctx[0x2E0]) / 16.0f};
-    if (changed(dyn.bias, bias) || first) RenderProbe::Cmd(RenderProbe::Bias), vkCmdSetDepthBias(cmd, bias[0], bias[1], bias[2]);
+    if (raster[5]) {
+        const float bias[3]{F(ctx[0x2E1]), F(ctx[0x2DF]), F(ctx[0x2E0]) / 16.0f};
+        if (changed(dyn.bias, bias) || !dyn.bias_set)
+            dyn.bias_set = true, RenderProbe::Cmd(RenderProbe::Bias), vkCmdSetDepthBias(cmd, bias[0], bias[1], bias[2]);
+    }
     // A clearing draw leaves the clear value.
     const u32 dz[5]{depth && z_test && !db_clear, depth && z_write && !db_clear, depth_control >> 4 & 7, depth && depth->stencil && stencil_eff && !db_clear,
                     depth && z_bounds && !db_clear};
@@ -940,31 +944,35 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         const float bounds[2]{bmin, bmax};
         if (changed(dyn.bounds, bounds) || first) RenderProbe::Cmd(RenderProbe::Bounds), vkCmdSetDepthBounds(cmd, bounds[0], bounds[1]);
     }
-    const u32 sc_ctl = ctx[0x10B], ref = ctx[0x10C], back = depth_control >> 7 & 1, rb = back ? ctx[0x10D] : ref;
-    const u32 st[14]{sc_ctl & 0xF, sc_ctl >> 4 & 0xF, sc_ctl >> 8 & 0xF, depth_control >> 8 & 7, (back ? sc_ctl >> 12 : sc_ctl) & 0xF,
-                     (back ? sc_ctl >> 16 : sc_ctl >> 4) & 0xF, (back ? sc_ctl >> 20 : sc_ctl >> 8) & 0xF,
-                     back ? depth_control >> 20 & 7 : depth_control >> 8 & 7, ref & 0xFF, ref >> 8 & 0xFF, ref >> 16 & 0xFF, rb & 0xFF, rb >> 8 & 0xFF,
-                     rb >> 16 & 0xFF};
+    const u32 ref = ctx[0x10C], back = depth_control >> 7 & 1, rb = back ? ctx[0x10D] : ref;
     VkRect2D draw_sc = sc;
     // The projection writes 1 outside the atlas rect, an identity for unscaled MIN on UNORM.
     if (shadow_quad && ps && !blend_mode && col_format == 4 && (bc0 >> 30 & 1) && (bc0 & 0x1fff) == 0x141 &&
         ColorFormat(info0) == VK_FORMAT_R8G8B8A8_UNORM && std::none_of(color + 1, color + 8, [](const Target* t) { return t != nullptr; }) &&
-        !db_clear && !z_write && (!stencil || (!st[10] && !st[13])) && !raster[1] && !pred &&
+        !db_clear && !z_write && (!stencil || (!(ref >> 16 & 0xFF) && !(rb >> 16 & 0xFF))) && !raster[1] && !pred &&
         query_next == ~0u && query_on == ~0u && !query_open && ctx[0x1B3] == 2 && ctx[0x1B4] == 2 && ctx[0x191] == 0 &&
         vp.x == 0 && vp.y == rh && vp.width == rw && vp.height == -float(rh) &&
         draw_rts.size() == vs_rts + 2 && ShadowProjection(prep.pkey, prep.in, ps_table, prep.desc))
         draw_sc = ShadowScissor(sc, vp, ps_table);
     if (changed(dyn.sc, draw_sc) || first) RenderProbe::Cmd(RenderProbe::Scissor), vkCmdSetScissorWithCount(cmd, 1, &draw_sc);
-    if (changed(dyn.stencil, st) || first) {
-        RenderProbe::Cmd(RenderProbe::Stencil, 8);
-        vkCmdSetStencilOp(cmd, VK_STENCIL_FACE_FRONT_BIT, StencilOp(st[0]), StencilOp(st[1]), StencilOp(st[2]), (VkCompareOp)st[3]);
-        vkCmdSetStencilOp(cmd, VK_STENCIL_FACE_BACK_BIT, StencilOp(st[4]), StencilOp(st[5]), StencilOp(st[6]), (VkCompareOp)st[7]);
-        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT, st[8]);
-        vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_BIT, st[9]);
-        vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_BIT, st[10]);
-        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT, st[11]);
-        vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_BACK_BIT, st[12]);
-        vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, st[13]);
+    if (dz[3]) {
+        const u32 sc_ctl = ctx[0x10B];
+        const u32 st[14]{sc_ctl & 0xF, sc_ctl >> 4 & 0xF, sc_ctl >> 8 & 0xF, depth_control >> 8 & 7, (back ? sc_ctl >> 12 : sc_ctl) & 0xF,
+                         (back ? sc_ctl >> 16 : sc_ctl >> 4) & 0xF, (back ? sc_ctl >> 20 : sc_ctl >> 8) & 0xF,
+                         back ? depth_control >> 20 & 7 : depth_control >> 8 & 7, ref & 0xFF, ref >> 8 & 0xFF, ref >> 16 & 0xFF, rb & 0xFF, rb >> 8 & 0xFF,
+                         rb >> 16 & 0xFF};
+        if (changed(dyn.stencil, st) || !dyn.stencil_set) {
+            dyn.stencil_set = true;
+            RenderProbe::Cmd(RenderProbe::Stencil, 8);
+            vkCmdSetStencilOp(cmd, VK_STENCIL_FACE_FRONT_BIT, StencilOp(st[0]), StencilOp(st[1]), StencilOp(st[2]), (VkCompareOp)st[3]);
+            vkCmdSetStencilOp(cmd, VK_STENCIL_FACE_BACK_BIT, StencilOp(st[4]), StencilOp(st[5]), StencilOp(st[6]), (VkCompareOp)st[7]);
+            vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_BIT, st[8]);
+            vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_BIT, st[9]);
+            vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_BIT, st[10]);
+            vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_BACK_BIT, st[11]);
+            vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_BACK_BIT, st[12]);
+            vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_BACK_BIT, st[13]);
+        }
     }
     const Target* probe_target = blend_mode ? color[0] : nullptr;
     if (color_count) {
@@ -1143,15 +1151,15 @@ void Renderer::Impl::Dispatch(const u32* b, const CpuRead& cpu) {
     if (!Identify(Gcn::Stage::Compute, addr, &sh[0x240], cpu, sh[0x212], sh[0x213], false, prep))
         return stores.clear(), Count(stats.skipped), Note("dispatch without CS skipped");
     if (!stats.trace && prep.linear_copy && TryLinearCopyDispatch(b, cpu)) return;
-    std::vector<u32> table;
+    cs_table.clear();
     u64 unused = 0;
     dispatching = true;
-    const ShaderRef cs = Shader(Gcn::Stage::Compute, addr, &sh[0x240], cpu, sh[0x212], sh[0x213], unused, false, table, 0, true);
+    const ShaderRef cs = Shader(Gcn::Stage::Compute, addr, &sh[0x240], cpu, sh[0x212], sh[0x213], unused, false, cs_table, 0, true);
     dispatching = false;
     if (!cs) return stores.clear(), Count(stats.skipped), Note("dispatch without CS skipped");
-    const u64 n = table.size() * 4, at = TableAt(n, table_align);
+    const u64 n = cs_table.size() * 4, at = TableAt(n, table_align);
     if (at == ~0ull) return stores.clear(), Count(stats.skipped), Note("draw tables full");
-    if (n) std::memcpy(TablePtr() + at, table.data(), n);
+    if (n) std::memcpy(TablePtr() + at, cs_table.data(), n);
     if (std::any_of(draw_rts.begin(), draw_rts.end(), [&](auto& u) { return In(hz.w, u.first) || (u.second && In(hz.r, u.first)); })) FlushStores();
     EndRendering();
     // Buffers the program stores to (format stores): their memory is mapped for the GPU and counts as a GPU write (images over it
@@ -1386,7 +1394,9 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
         for (const auto& s : made) r.Note(s);
     }
     if (r.temp_qp) vkResetQueryPool(r.dev, r.temp_qp, r.slot * 6, 6);  // GPU timestamps: the pool exists only in a debug run
-    vkResetQueryPool(r.dev, r.query_pool, r.slot * Impl::kQueries, Impl::kQueries), r.query_blocks.clear();
+    if (r.slot_rays[r.slot]) vkResetQueryPool(r.dev, r.query_pool, r.slot * Impl::kQueries, r.slot_rays[r.slot]);
+    if (r.slot_mesh[r.slot] > Impl::kRays) vkResetQueryPool(r.dev, r.query_pool, r.slot * Impl::kQueries + Impl::kRays, r.slot_mesh[r.slot] - Impl::kRays);
+    r.slot_rays[r.slot] = 0, r.slot_mesh[r.slot] = Impl::kRays, r.query_blocks.clear();
     r.mesh.clear(), r.mesh_copied = Impl::query_seq = Impl::kRays, Impl::query_next = Impl::query_on = ~0u, Impl::pred = 0;
     auto temp_ts = [&](VkCommandBuffer c, u32 k) { if (r.temp_qp) vkCmdWriteTimestamp2(c, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, r.temp_qp, r.slot * 6 + k); };
     // Guest ranges the CPU wrote since the last frame, and the last frame's GPU writes: processed before eviction/regrow
@@ -1829,6 +1839,7 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
         r.stats.compiled.clear(), r.stats.compiled.swap(r.compiled);
     }
     r.NoteFrameBuffers();
+    r.slot_rays[r.slot] = (u32)r.query_blocks.size(), r.slot_mesh[r.slot] = Impl::query_seq;
     r.SwapFrame();
     r.flight.busy = true, r.flight.queries = (u32)r.query_blocks.size(), r.flight.frame = r.frame;
     r.stage_at = 0, r.stage_used = 0;  // the retired frame's staging chunks

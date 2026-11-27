@@ -333,7 +333,7 @@ const u8* Renderer::Impl::Stage(u64 addr, const u8* src, u64 n, u64* hash) {
 // render, so only a VRAM copy stays in front of this frame's draws. The later `copied` signal on that queue covers it.
 void Renderer::Impl::RecordSend(VkCommandBuffer c) {
     if (!use_stage_dev) return;
-    std::vector<VkBufferCopy> copies;
+    static thread_local std::vector<VkBufferCopy> copies;
     auto send_span = [&](std::span<const Pending> src) {
         for (size_t i = 0, j; i < src.size(); i = j) {
             for (j = i; j < src.size() && src[j].chunk == src[i].chunk;) ++j;
@@ -367,7 +367,7 @@ void Renderer::Impl::Send() {
 
 // Staged guest writes -> mirror, recorded at the start of the frame's command buffer: the sent ones from VRAM.
 void Renderer::Impl::Flush(VkCommandBuffer c) {
-    std::vector<VkBufferCopy> copies;
+    static thread_local std::vector<VkBufferCopy> copies;
     if (boom_on) boom_up[slot].clear();
     for (size_t i = 0; i < pending.size();) {
         const u32 chunk = pending[i].chunk;
