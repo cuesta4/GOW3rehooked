@@ -1894,7 +1894,7 @@ void Renderer::Impl::CompactImageBlocks() {
     }
     // Textures whose content may exist only in their image (a GPU write not in guest memory yet) stay.
     std::unordered_set<const GuestTex*> written;
-    for (auto* list : {&gpu_writes, &last_writes, &lazy_writes, &block_writes})
+    for (auto* list : {&gpu_writes, &last_writes, &lazy_writes})
         for (auto& w : *list)
             if (w.by) written.insert(w.by);
     for (auto& p : prologue_lazy)
@@ -3001,8 +3001,14 @@ void Renderer::Impl::WriteBack() {
         if (temp_copylog) TempCopy(lazy ? "WB-lazy" : linear ? "WB-linear" : "WB-tiled", g, std::format(" | mip {} {:.2f} MB", m, l.size / 1048576.0));
         const u64 seq = std::atomic_ref(write_seq).fetch_add(1) + 1;
         const GpuWrite w{g.base + l.offset, g.base + l.offset + l.size, seq, &g, lazy};
-        if (in_worker) own_writes.push_back(w), (*synced_here)[&g] = seq;
-        else gpu_writes.push_back(w), g.synced = seq;
+        if (in_worker) {
+            own_writes.push_back(w), (*synced_here)[&g] = seq;
+            std::scoped_lock nl(note_lock);
+            storage_draw_progs.insert(draw_ps_addr ^ (draw_vs_addr * 0x9E3779B97F4A7C15ull));
+            has_storage_draw_progs.store(true, std::memory_order_relaxed);
+        } else {
+            gpu_writes.push_back(w), g.synced = seq;
+        }
     }
     stores.clear();
     // The copies write image memory in the mirror, which uploads (transfers, compute) and shaders sample as textures; the

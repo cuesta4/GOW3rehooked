@@ -637,8 +637,10 @@ struct Renderer::Impl {
             if (p.first.by == w.by && p.first.lo == w.lo) return void(p.second |= learn);
         prologue_lazy.push_back({w, learn});
     }
-    std::vector<GpuWrite> block_writes;  // this frame's parallel blocks' (they join gpu_writes after recording)
     u64 write_seq = 0, frame_seq = 0;  // frame_seq: write_seq when the frame started
+    std::unordered_set<u64> storage_draw_progs;
+    std::atomic<bool> has_storage_draw_progs{false};
+    static inline thread_local u64 draw_vs_addr = 0, draw_ps_addr = 0;
     // Images made this frame (targets): to GENERAL and cleared in the frame's prologue, before any block
     // that uses them, whichever thread made them.
     std::vector<std::pair<VkImage, VkImageAspectFlags>> fresh;
@@ -1178,6 +1180,7 @@ struct Renderer::Impl {
         std::vector<std::pair<GuestTex*, u64>> resync;  // images it samples, with the GPU write they must reflect (Submit uploads)
         std::vector<GuestTex*> resync_vs;               // those its vertex shaders sample
         std::vector<std::pair<GpuWrite, bool>> lazy;    // writes those uploads need written back first (Materialize's `learn`)
+        std::vector<GpuWrite> writes;                   // GuestTex storage writes recorded by this block (merged in chain order)
         // Hazards (lazy pass ends): targets written / sampled before its first full barrier (`all`: something there
         // needed every earlier write done) and since its last one.
         std::vector<VkImage> in_w, in_r, out_w, out_r, out_wv, vs_in;  // as in Hazards
