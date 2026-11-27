@@ -1386,8 +1386,23 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     vkResetQueryPool(r.dev, r.query_pool, r.slot * Impl::kQueries, Impl::kQueries), r.query_blocks.clear();
     r.mesh.clear(), r.mesh_copied = Impl::query_seq = Impl::kRays, Impl::query_next = Impl::query_on = ~0u, Impl::pred = 0;
     auto temp_ts = [&](VkCommandBuffer c, u32 k) { if (r.temp_qp) vkCmdWriteTimestamp2(c, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, r.temp_qp, r.slot * 6 + k); };
-    // Guest ranges the CPU wrote since the last frame, and the last frame's GPU writes: processed before eviction/regrow
-    // so pending lazy writes are known and materialized rather than dropped.
+    // After an overflow, the longest age that frees an eighth of the full array (age 1 keeps only what the frame that
+    // overflowed used: Rage of Sparta's grab passes overflowed the storage array every ~50 frames, and age 1 re-uploaded
+    // the ~240 textures used every few frames at once). Their images go later (Reap). Under memory pressure, textures unused
+    // for a few frames go now: a failed allocation skips its texture, upload or copy (stale or garbage images).
+    if (const u32 pressed = r.PressureAge(); r.frame % 64 == 0 || r.evict_soon || pressed)
+        Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] {
+            if (!r.evict_soon) return r.EvictTextures(pressed ? pressed : 64);
+            const u32 cap = r.evict_binding >= kStorageBinding ? kStorage : kTextures;
+            if (r.free_elements[r.evict_binding].size() < cap / 8)
+                for (u32 age : {16u, 4u, 1u})
+                    if (r.EvictTextures(age), r.free_elements[r.evict_binding].size() >= cap / 8) break;
+            if (pressed) r.EvictTextures(pressed);
+        }), r.evict_soon = false;
+    if (r.frame % (r.Pressed() ? 32 : 128) == 0) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.CompactImageBlocks(); });
+    if (r.regrow) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.Regrow(); });
+    if (r.stats.trace) r.BeginTraceProbes();
+    // Guest ranges the CPU wrote since the last frame, and the last frame's GPU writes: textures over them are uploaded again.
     r.dirty.clear();
     for (auto& p : r.pending) r.dirty.push_back({p.addr, p.addr + p.size});
     r.dirty.insert(r.dirty.end(), deferred.begin(), deferred.end());  // staged after recording: as written by the CPU
@@ -1406,22 +1421,6 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     for (const auto& w : r.last_writes)
         if (!w.lazy && !w.by)
             for (u64 p = w.lo >> 12, end = std::min((w.hi + 0xFFF) >> 12, Impl::kPieces); p < end; ++p) r.staged_table.get()[p] = r.frame;
-    // After an overflow, the longest age that frees an eighth of the full array (age 1 keeps only what the frame that
-    // overflowed used: Rage of Sparta's grab passes overflowed the storage array every ~50 frames, and age 1 re-uploaded
-    // the ~240 textures used every few frames at once). Their images go later (Reap). Under memory pressure, textures unused
-    // for a few frames go now: a failed allocation skips its texture, upload or copy (stale or garbage images).
-    if (const u32 pressed = r.PressureAge(); r.frame % 64 == 0 || r.evict_soon || pressed)
-        Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] {
-            if (!r.evict_soon) return r.EvictTextures(pressed ? pressed : 64);
-            const u32 cap = r.evict_binding >= kStorageBinding ? kStorage : kTextures;
-            if (r.free_elements[r.evict_binding].size() < cap / 8)
-                for (u32 age : {16u, 4u, 1u})
-                    if (r.EvictTextures(age), r.free_elements[r.evict_binding].size() >= cap / 8) break;
-            if (pressed) r.EvictTextures(pressed);
-        }), r.evict_soon = false;
-    if (r.frame % (r.Pressed() ? 32 : 128) == 0) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.CompactImageBlocks(); });
-    if (r.regrow) Impl::Stalled(r.stall_evicts, r.stall_evict_ns, [&] { r.Regrow(); });
-    if (r.stats.trace) r.BeginTraceProbes();
     // Targets whose memory the CPU rewrote, and single-sampled ones a texture's storage write went over: textures again
     // until drawn again (`rendered` ~0u). A base leaves `target_at` with its last drawn target.
     if (!r.target_at.empty() && (!r.dirty.empty() || !r.last_writes.empty())) {
@@ -1705,12 +1704,8 @@ void Renderer::Submit(std::span<const Segment> chain, const CpuRead& cpu, std::s
     } else  // the frame before's readback copies (after its last barrier) still read the mirror this frame writes
         Impl::StageBarrier(r.copy_cmd, VK_PIPELINE_STAGE_2_COPY_BIT, 0, VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, 0);
     GOW3_DIAG r.stats.temp_ms[12] = (r.stats.uploaded - temp_up) / 1048576.0;
-    for (auto& [w, learn] : r.prologue_lazy) {  // earlier writes left in their image that these uploads read
-        if (std::erase_if(r.lazy_writes, [&](const Impl::GpuWrite& x) { return x.by == w.by && x.lo == w.lo; }))
-            r.Materialize(r.copy_cmd, w, learn);
-        else if (learn && w.by && w.by->surf)
-            w.by->surf->foreign = true;
-    }
+    for (auto& [w, learn] : r.prologue_lazy)  // earlier writes left in their image that these uploads read
+        if (std::erase_if(r.lazy_writes, [&](const Impl::GpuWrite& x) { return x.by == w.by && x.lo == w.lo; })) r.Materialize(r.copy_cmd, w, learn);
     r.prologue_lazy.clear();
     for (auto [img, aspect] : r.fresh) {
         Impl::ToGeneral(r.copy_cmd, img, aspect);

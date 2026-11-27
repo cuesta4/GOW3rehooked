@@ -1818,22 +1818,7 @@ u32 Renderer::Impl::Bindless(u32 binding, VkImageView view, VkSampler smp) {
 // Guest textures unused for more than `age` frames: bindless elements freed (no frame samples them), views and images
 // destroyed by Reap once the frame being recorded has retired (it and the frame in flight may still copy from them).
 void Renderer::Impl::EvictTextures(u32 age, bool defer_elements) {
-    const auto raw_old = [&](const GuestTex& g) { return g.checked == ~0u || frame - g.checked > age || std::binary_search(doomed.begin(), doomed.end(), &g); };
-    auto by_cpu = [&](const GpuWrite& w) {
-        auto c = std::upper_bound(dirty.begin(), dirty.end(), std::pair{w.hi, 0ull});
-        return c != dirty.begin() && std::prev(c)->second > w.lo;
-    };
-    std::unordered_set<const GuestTex*> keep_lazy;
-    for (const auto& p : prologue_lazy)
-        if (p.first.by) keep_lazy.insert(p.first.by);
-    // Materialize expiring lazy writes at the frame's prologue instead of discarding GPU contents; delay evicting their owner by one pass.
-    for (const GpuWrite& w : lazy_writes)
-        if (w.by && raw_old(*w.by)) {
-            if (!by_cpu(w)) QueuePrologueLazy(w, false), keep_lazy.insert(w.by);
-            else if (w.by->surf) w.by->surf->foreign = true;
-        }
-    std::erase_if(lazy_writes, [&](const GpuWrite& w) { return w.by && raw_old(*w.by) && by_cpu(w); });
-    const auto old = [&](const GuestTex& g) { return !keep_lazy.contains(&g) && raw_old(g); };
+    const auto old = [&](const GuestTex& g) { return g.checked == ~0u || frame - g.checked > age || std::binary_search(doomed.begin(), doomed.end(), &g); };
     std::vector<const GuestTex*> gone;
     for (auto& [h, g] : textures)
         if (old(g)) gone.push_back(&g);
@@ -2373,10 +2358,6 @@ bool Renderer::Impl::Describe(GuestTex& g, const u32* t) {
 // Start of a frame: the T#s of a surface whose image grew move to the new image (old views, images and bindless slots wait for Retire).
 void Renderer::Impl::Regrow() {
     regrow = false;
-    auto by_cpu = [&](const GpuWrite& w) {
-        auto c = std::upper_bound(dirty.begin(), dirty.end(), std::pair{w.hi, 0ull});
-        return c != dirty.begin() && std::prev(c)->second > w.lo;
-    };
     std::vector<const GuestTex*> moved;
     for (auto& [h, g] : textures) {
         if (!g.surf) continue;
@@ -2385,19 +2366,6 @@ void Renderer::Impl::Regrow() {
         const std::shared_ptr<Tex> cur = s.t.lock();
         if (!cur) s.t = g.shared, s.img = g.shared ? g.shared->img : VK_NULL_HANDLE, s.w = g.iw, s.h = g.ih, s.current = s.valid_frame = ~0u, s.valid_w = s.valid_h = 0;  // the grown image's T#s are gone: this one's is the surface's again
         if (!cur || cur == g.shared || g.w > s.w || g.h > s.h || (!g.flat && (g.w != s.w || g.h != s.h))) continue;
-        // Materialize pending lazy writes from the old image before switching `g` to the grown one.
-        bool defer = false;
-        std::erase_if(lazy_writes, [&](const GpuWrite& w) {
-            if (w.by != &g) return false;
-            if (by_cpu(w)) return true;
-            QueuePrologueLazy(w, false);
-            defer = true;
-            return false;
-        });
-        if (defer) {
-            regrow = s.growing = true;
-            continue;
-        }
         graves.views.insert(graves.views.end(), g.owned.begin(), g.owned.end());
         g.owned.clear(), std::fill_n(g.mip_views, 16, VK_NULL_HANDLE);
         if (g.shared) graves.shared.push_back(std::move(g.shared));
@@ -2457,7 +2425,7 @@ void Renderer::Impl::Check(GuestTex& g) {
         for (auto& w : lazy_writes)
             if (foreign(w) && w.by) {
                 if (by_cpu(w)) w.by->surf->foreign = true;
-                else QueuePrologueLazy(w, !g.surf || w.by->surf != g.surf);
+                else prologue_lazy.push_back({w, !g.surf || w.by->surf != g.surf});
             }
         if (temp_copylog) {
             std::string why = g.fresh ? " fresh" : g.reload ? " reload" : staged ? " cpu" : " dirty";
