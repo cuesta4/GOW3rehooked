@@ -333,6 +333,8 @@ Renderer::~Renderer() {
         if (p.main) vkDestroyPipeline(d->dev, p.main, nullptr);
         if (p.square) vkDestroyPipeline(d->dev, p.square, nullptr);
     }
+    for (VkPipeline p : d->retired_pipelines) vkDestroyPipeline(d->dev, p, nullptr);
+    d->retired_pipelines.clear();
     for (auto p : d->gpl_vi)
         if (p) vkDestroyPipeline(d->dev, p, nullptr);
     for (auto& [k, p] : d->gpl_prerast)

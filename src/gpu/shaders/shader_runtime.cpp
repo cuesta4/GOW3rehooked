@@ -1196,8 +1196,14 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
             const VkPipeline libs[4]{vi, prerast, fs, foi};
             CompiledPipeline pl = LinkGplPair(libs, foi_sq, true, true);
             const PlOrigin origin = pl.main ? kPlGplLto : kPlGplLink;
-            if (!pl.main) pl = LinkGplPair(libs, foi_sq, false, false);
-            if (pl.main) return pm[rh] = KeepPipeline(h, pl, origin);
+            if (!pl.main && (caps.gpl_fast_link || stats.trace || Jit::mode != Jit::Mode::Async))
+                pl = LinkGplPair(libs, foi_sq, false, false);
+            if (pl.main) {
+                const CompiledPipeline kept = KeepPipeline(h, pl, origin);
+                if (origin == kPlGplLink && !stats.trace && caps.gpl_fast_link && kept.main == pl.main)
+                    EnqueueGplLto(h, libs, foi_sq);
+                return pm[rh] = kept;
+            }
         }
     }
     // A pipeline in the pipeline cache (built by the AOT or an earlier run) still costs the driver a load. Async: the load
