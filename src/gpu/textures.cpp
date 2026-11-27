@@ -3386,7 +3386,7 @@ std::vector<Image> Renderer::ReadTargets() {
             } else {
                 for (u32 k = 0; k < std::min(texel, 4u); ++k) c[k] = s[k] / 255.0f;
             }
-            if (t.bgra) std::swap(c[0], c[2]);  // memory order B, G, R, A (COMP_SWAP)
+            if (std::atomic_ref(t.bgra).load(std::memory_order_relaxed)) std::swap(c[0], c[2]);  // memory order B, G, R, A (COMP_SWAP)
             for (u32 k = 0; k < 3; ++k) o[k] = to8(c[k]);
             o[3] = 255;
         }

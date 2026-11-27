@@ -285,9 +285,11 @@ DynamicCaps QueryDynamicCaps(VkPhysicalDevice pd, std::span<const VkExtensionPro
 
     const bool has_eds3 = HasExtension(available, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
     VkPhysicalDeviceDriverProperties driver_p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
-    VkPhysicalDeviceExtendedDynamicState3PropertiesEXT eds3_p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT, &driver_p};
-    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, has_eds3 ? static_cast<void*>(&eds3_p) : &driver_p};
+    VkPhysicalDeviceFloatControlsProperties fc_p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES, &driver_p};
+    VkPhysicalDeviceExtendedDynamicState3PropertiesEXT eds3_p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_PROPERTIES_EXT, &fc_p};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, has_eds3 ? static_cast<void*>(&eds3_p) : &fc_p};
     vkGetPhysicalDeviceProperties2(pd, &p2);
+    c.signed_zero_inf_nan_preserve = fc_p.shaderSignedZeroInfNanPreserveFloat32 != VK_FALSE;
 
     // Pre-Turing NVIDIA (Maxwell/Pascal/Volta) on the proprietary driver: VK_EXT_shader_object triggers intermittent SM
     // WRITE_INVALID device-lost faults (e.g. GTX 1080 Ti on R580); Turing+ exposes mesh shaders. Fall back to GPL/monolithic.
@@ -437,10 +439,19 @@ VkResult CreateDevice(VkPhysicalDevice pd, u32 family, std::span<const char* con
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT, nullptr, VK_TRUE};
     VkPhysicalDeviceExtendedDynamicState3FeaturesEXT eds3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
 
+    VkPhysicalDeviceVulkan13Features sup13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceVulkan12Features sup12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &sup13};
+    VkPhysicalDeviceVulkan11Features sup11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &sup12};
+    VkPhysicalDeviceFeatures2 sup2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &sup11};
+    vkGetPhysicalDeviceFeatures2(pd, &sup2);
+    const auto& sup = sup2.features;
+
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
-    f13.dynamicRendering = f13.synchronization2 = f13.maintenance4 = f13.shaderDemoteToHelperInvocation = VK_TRUE;
+    f13.dynamicRendering = f13.synchronization2 = VK_TRUE;
+    f13.maintenance4 = sup13.maintenance4;
+    f13.shaderDemoteToHelperInvocation = sup13.shaderDemoteToHelperInvocation;
     // A slot that falls back to the 1x1 dummy: its out-of-bounds writes are dropped, not stray.
-    f13.robustImageAccess = VK_TRUE;
+    f13.robustImageAccess = sup13.robustImageAccess;
 
     if (dc.path == ShaderPath::Objects) {
         ext.push_back(VK_EXT_SHADER_OBJECT_EXTENSION_NAME);
@@ -477,19 +488,34 @@ VkResult CreateDevice(VkPhysicalDevice pd, u32 family, std::span<const char* con
     f12.bufferDeviceAddress = f12.descriptorIndexing = f12.runtimeDescriptorArray = f12.descriptorBindingPartiallyBound = VK_TRUE;
     f12.descriptorBindingSampledImageUpdateAfterBind = f12.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
     f12.shaderSampledImageArrayNonUniformIndexing = f12.shaderStorageImageArrayNonUniformIndexing = f12.scalarBlockLayout = VK_TRUE;
-    f12.shaderInt8 = f12.storageBuffer8BitAccess = f12.samplerFilterMinmax = f12.samplerMirrorClampToEdge = VK_TRUE;  // tiling.comp, S#
-    f12.hostQueryReset = VK_TRUE;  // trace probes
+    f12.shaderInt8 = sup12.shaderInt8;
+    f12.storageBuffer8BitAccess = sup12.storageBuffer8BitAccess;
+    f12.samplerFilterMinmax = sup12.samplerFilterMinmax;
+    f12.samplerMirrorClampToEdge = sup12.samplerMirrorClampToEdge;  // tiling.comp, S#
+    f12.hostQueryReset = sup12.hostQueryReset;                      // trace probes
     VkPhysicalDeviceVulkan11Features f11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, &f12};
-    f11.storageBuffer16BitAccess = VK_TRUE;
+    f11.storageBuffer16BitAccess = sup11.storageBuffer16BitAccess;
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f11};
     auto& f = f2.features;
-    f.shaderInt16 = VK_TRUE;
-    f.geometryShader = f.sparseBinding = f.sparseResidencyBuffer = f.shaderInt64 = f.independentBlend = f.dualSrcBlend = VK_TRUE;
-    f.samplerAnisotropy = f.imageCubeArray = f.fragmentStoresAndAtomics = f.vertexPipelineStoresAndAtomics = f.depthClamp = VK_TRUE;
+    f.shaderInt16 = sup.shaderInt16;
+    f.geometryShader = sup.geometryShader;
+    f.sparseBinding = f.sparseResidencyBuffer = VK_TRUE;
+    f.shaderInt64 = sup.shaderInt64;
+    f.independentBlend = sup.independentBlend;
+    f.dualSrcBlend = sup.dualSrcBlend;
+    f.samplerAnisotropy = sup.samplerAnisotropy;
+    f.imageCubeArray = sup.imageCubeArray;
+    f.fragmentStoresAndAtomics = sup.fragmentStoresAndAtomics;
+    f.vertexPipelineStoresAndAtomics = sup.vertexPipelineStoresAndAtomics;
+    f.depthClamp = sup.depthClamp;
     f.depthBounds = dc.depth_bounds ? VK_TRUE : VK_FALSE;
     f.shaderStorageImageReadWithoutFormat = dc.storage_image_read_without_format ? VK_TRUE : VK_FALSE;
-    f.shaderStorageImageWriteWithoutFormat = f.shaderStorageImageExtendedFormats = f.depthBiasClamp = f.logicOp = VK_TRUE;
-    f.pipelineStatisticsQuery = f.occlusionQueryPrecise = VK_TRUE;
+    f.shaderStorageImageWriteWithoutFormat = sup.shaderStorageImageWriteWithoutFormat;
+    f.shaderStorageImageExtendedFormats = sup.shaderStorageImageExtendedFormats;
+    f.depthBiasClamp = sup.depthBiasClamp;
+    f.logicOp = sup.logicOp;
+    f.pipelineStatisticsQuery = sup.pipelineStatisticsQuery;
+    f.occlusionQueryPrecise = sup.occlusionQueryPrecise;
     const float prio[2]{1.0f, 1.0f};
     const auto fp = QueueFamilies(pd);
     // The second queue (when the family has one) uploads the next frame while this one renders; two of the copy engine's

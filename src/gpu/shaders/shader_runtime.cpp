@@ -429,6 +429,7 @@ bool Renderer::Impl::Identify(Gcn::Stage stage, u64 prog, const u32* user, const
     in.boom = boom_on && !in.probe && stage == Gcn::Stage::Vertex;
     in.rect = rect && stage == Gcn::Stage::Vertex;
     in.no_storage_read_nofmt = !caps.storage_image_read_without_format;
+    in.no_float_controls = !caps.signed_zero_inf_nan_preserve;
     static const char* probe_pc = DebugOption("GOW3_PROBE_PC");  // e.g. 100017: after the fetch
     if (in.probe && probe_pc) in.probe_pc = (u32)std::strtoul(probe_pc, nullptr, 16);
     p.pkey = ProgramKey(stage, pm.hash, fetch_hash, rsrc2, in.probe, in.boom);
@@ -530,6 +531,7 @@ u64 TranslationKey(u64 program_key, const Gcn::Input& in, std::span<const Gcn::S
                                    ::Gpu::PieceHash::ShaderKey(&in.mrt_class, 16, key ^ in.ps_input_ena ^ (u64)in.ps_input_addr << 32 ^ in.col_format));
     if (in.blend_interlock) key = ::Gpu::PieceHash::ShaderKey(&in.blend_interlock, sizeof(in.blend_interlock), key);
     if (in.no_storage_read_nofmt) key ^= 0x53544F524E4F5244ull;
+    if (in.no_float_controls) key ^= 0x464C544354524C30ull;
     return key;
 }
 
@@ -1278,7 +1280,7 @@ void Renderer::Impl::TempPlWrite() {
                         u32(caps.alpha_to_coverage_enable) << 3 | u32(caps.color_blend_enable) << 4 | u32(caps.color_blend_equation) << 5 |
                         u32(caps.color_write_mask) << 6 | u32(caps.unrestricted_topology) << 7;
     // Format 2: the pipeline recipes as this GPU draws them follow (raw keys).
-    const auto recipes = Recipes::Instance().Pipelines(!caps.storage_image_read_without_format, blend_interlock);
+    const auto recipes = Recipes::Instance().Pipelines(!caps.storage_image_read_without_format, blend_interlock, !caps.signed_zero_inf_nan_preserve);
     const u32 head[8]{0x4C503347, 2, u32(caps.path), capbits, u32(temp_pl_states.size()), u32(temp_pl_made.size()), u32(recipes.size()), 0};  // "G3PL"
     std::vector<u8> out;
     const auto append = [&](const void* p, size_t n) { out.insert(out.end(), (const u8*)p, (const u8*)p + n); };
@@ -1310,7 +1312,7 @@ void Renderer::Impl::TempPlWrite() {
 void Renderer::Impl::WarmPipelines() {
     if (caps.path == ShaderPath::Objects || !caps.cache_control) return;
     std::call_once(warm_once, [&] {  // the recipes as this GPU draws them (those this run meets are made by then)
-        warm_recipes = Recipes::Instance().Pipelines(!caps.storage_image_read_without_format, blend_interlock);
+        warm_recipes = Recipes::Instance().Pipelines(!caps.storage_image_read_without_format, blend_interlock, !caps.signed_zero_inf_nan_preserve);
         for (GraphicsPipelineKey& k : warm_recipes) k.state.Canonicalize(caps);
     });
     for (const GraphicsPipelineKey& gk : warm_recipes) {

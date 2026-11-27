@@ -74,6 +74,7 @@ struct Input {
     bool boom = false;  // VS counts exploded positions (first index, its loads, gl_Position) at res[slots..+1] (live)
     bool rect = false;  // VS expands a 3-vertex DI_PT_RECTLIST into a 4-vertex triangle strip: each vertex runs the program for the three corners
     bool no_storage_read_nofmt = false;  // GPU lacks shaderStorageImageReadWithoutFormat: keep image_load on Texture (OpImageFetch) instead of merging into Storage
+    bool no_float_controls = false;      // GPU lacks shaderSignedZeroInfNanPreserveFloat32
 };
 
 // Per slot, from the descriptor at draw time (part of the translation key).

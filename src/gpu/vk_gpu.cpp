@@ -496,8 +496,9 @@ void Renderer::Impl::Draw(u32 op, const u32* b, const CpuRead& cpu) {
         color[k] = GetTarget((u64)cb[0] << 8, pitch, ph, fmt, false, false, cb_extent[k], 1u << (cb[5] >> 12 & 7), cb[5] & 0x1F);  // ATTRIB NUM_SAMPLES, TILE_MODE_INDEX
         if (!color[k]) return Count(stats.skipped), Note("render target allocation failed");
         // Written only when it changes: the target is shared by every recording thread.
-        if (const bool bgra = AmdGpu::MrtSwizzle(cb[4] >> 11 & 3, AmdGpu::DataFormat(cb[4] >> 2 & 0x1F)).Map(0) == 2; color[k]->bgra != bgra)
-            color[k]->bgra = bgra;
+        if (const bool bgra = AmdGpu::MrtSwizzle(cb[4] >> 11 & 3, AmdGpu::DataFormat(cb[4] >> 2 & 0x1F)).Map(0) == 2;
+            std::atomic_ref(color[k]->bgra).load(std::memory_order_relaxed) != bgra)
+            std::atomic_ref(color[k]->bgra).store(bgra, std::memory_order_relaxed);
         color_view[k] = fmt == color[k]->fmt ? color[k]->t.view : TargetAttachment(*color[k], fmt);
         rw = std::min(rw, color[k]->w), rh = std::min(rh, color[k]->h), color_count = k + 1;
     }
