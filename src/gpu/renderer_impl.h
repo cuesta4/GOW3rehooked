@@ -729,10 +729,16 @@ struct Renderer::Impl {
         TargetKey key;  // the whole key: entries are found by its hash
         const Target* t;
     };
+    struct MemoAttach {
+        const Target* t = nullptr;
+        VkFormat fmt = VK_FORMAT_UNDEFINED;
+        VkImageView view = VK_NULL_HANDLE;
+    };
     struct Memo {
         const Impl* owner = nullptr;
         u64 epoch = ~0ull;
         Flat<MemoTarget> targets;
+        Flat<MemoAttach> target_attach;
         Flat<u32> samplers;
         Flat<MemoTex> tex;                       // T# hash + binding
         Flat<std::pair<ShaderRef, u64>> shaders; // translation key -> shader, VS output mask
@@ -744,7 +750,7 @@ struct Renderer::Impl {
     Memo& Memos() {
         if (memo.owner != this) memo = {}, memo.owner = this;
         if (const u64 e = std::atomic_ref(epoch).load(std::memory_order_acquire); memo.epoch != e)
-            memo.tex.clear(), memo.targets.clear(), memo.epoch = e;
+            memo.tex.clear(), memo.targets.clear(), memo.target_attach.clear(), memo.epoch = e;
         return memo;
     }
     static inline thread_local bool table_ps = false;  // the table being built is a pixel shader's

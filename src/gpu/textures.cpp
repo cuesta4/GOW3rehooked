@@ -2094,9 +2094,14 @@ const Renderer::Impl::Target* Renderer::Impl::GetTarget(u64 base, u32 pitch, u32
 }
 
 VkImageView Renderer::Impl::TargetAttachment(const Target& t, VkFormat fmt) {
+    u64 h = u64(uintptr_t(&t)) ^ (u64(u32(fmt)) * 0x9E3779B97F4A7C15ull);
+    if (h == ~0ull) h = 0;
+    auto& m = Memos().target_attach;
+    if (const MemoAttach* e = m.Find(h); e && e->t == &t && e->fmt == fmt) return e->view;
     std::scoped_lock res(res_lock);
     VkImageView& v = t.attach[fmt];
     if (!v) v = View(t.t.img, VK_IMAGE_VIEW_TYPE_2D, fmt, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}, {}, t.t.usage);
+    if (v) m[h] = {&t, fmt, v};
     return v;
 }
 
