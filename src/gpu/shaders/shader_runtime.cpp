@@ -388,27 +388,32 @@ ShaderRef Renderer::Impl::Translated(Gcn::Stage stage, u64 prog, const CpuRead& 
     return shaders[key] = ref;
 }
 
-bool Renderer::Impl::Identify(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, bool rect, Prepared& p) {
-    RenderProbe::Scope identify_time(RenderProbe::Identify);
+Renderer::Impl::ProgMemo& Renderer::Impl::RefreshProgMemo(Gcn::Stage stage, u64 prog, const CpuRead& cpu) {
 #ifndef GOW3_OFFLINE
     if (const u32 gen = Gow3::GuestMemory::Generation(); prog_memo_gen != gen)
         prog_memo.clear(), fetch_memo.clear(), prog_memo_gen = gen;
 #endif
+    ProgMemo& pm = prog_memo[prog | (u64)stage];
+    if (pm.frame != frame) {
+        const bool dirty_code = !pm.ver || pm.ver != Version(prog, pm.code.size_bytes());
+        pm.frame = frame;
+        if (dirty_code) {
+            pm.code = Program(prog, cpu);
+            pm.hash = ::Gpu::PieceHash::ShaderCode(pm.code.data(), pm.code.size_bytes());
+            pm.orb_hash = pm.code.empty() ? 0 : ReadOrbFooterHash(prog, pm.code.size_bytes(), cpu);
+            pm.fetch_sgpr = stage == Gcn::Stage::Vertex ? FetchSgpr(pm.code) : -1;
+            pm.ver = Version(prog, pm.code.size_bytes());
+            pm.blend_key = ~0ull;
+        }
+    }
+    return pm;
+}
+
+bool Renderer::Impl::Identify(Gcn::Stage stage, u64 prog, const u32* user, const CpuRead& cpu, u32 rsrc1, u32 rsrc2, bool rect, Prepared& p) {
+    RenderProbe::Scope identify_time(RenderProbe::Identify);
     // Code, content hash and fetch SGPR, checked once per program per frame: read again only when a page under the code
     // changed (Version), every frame when that is unknown.
-    auto stale = [&](ProgMemo& m, u64 a) {
-        if (m.frame == frame) return false;
-        m.frame = frame;
-        return !m.ver || m.ver != Version(a, m.code.size_bytes());
-    };
-    ProgMemo& pm = prog_memo[prog | (u64)stage];
-    if (stale(pm, prog)) {
-        pm.code = Program(prog, cpu);
-        pm.hash = ::Gpu::PieceHash::ShaderCode(pm.code.data(), pm.code.size_bytes());
-        pm.orb_hash = pm.code.empty() ? 0 : ReadOrbFooterHash(prog, pm.code.size_bytes(), cpu);
-        pm.fetch_sgpr = stage == Gcn::Stage::Vertex ? FetchSgpr(pm.code) : -1;
-        pm.ver = Version(prog, pm.code.size_bytes());
-    }
+    const ProgMemo& pm = RefreshProgMemo(stage, prog, cpu);
     const auto code = pm.code;
     if (code.empty()) return Note(std::format("program {:x} unreadable", prog)), false;
     std::span<const u32> fetch;
@@ -416,7 +421,8 @@ bool Renderer::Impl::Identify(Gcn::Stage stage, u64 prog, const u32* user, const
     if (const int s = pm.fetch_sgpr; s >= 0 && s < 15)
         if (const u64 fa = (u64)(user[s + 1] & 0xFFFF) << 32 | user[s]) {
             ProgMemo& fm = fetch_memo[fa];
-            if (stale(fm, fa)) fm.code = FetchProgram(fa, cpu), fm.hash = ::Gpu::PieceHash::ShaderCode(fm.code.data(), fm.code.size_bytes()), fm.ver = Version(fa, fm.code.size_bytes());
+            const bool stale = fm.frame != frame && (fm.frame = frame, !fm.ver || fm.ver != Version(fa, fm.code.size_bytes()));
+            if (stale) fm.code = FetchProgram(fa, cpu), fm.hash = ::Gpu::PieceHash::ShaderCode(fm.code.data(), fm.code.size_bytes()), fm.ver = Version(fa, fm.code.size_bytes());
             fetch = fm.code, fetch_hash = fm.hash;
         }
     p.spec.clear(), p.desc.clear(), p.fdesc.clear(), p.in = {}, p.rect = rect;

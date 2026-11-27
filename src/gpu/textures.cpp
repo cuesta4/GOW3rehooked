@@ -2133,6 +2133,26 @@ u32 Renderer::Impl::TargetTexture(Target& rt, const u32* t, int kind, u32 bindin
     const auto raw = AmdGpu::DataFormat(t[1] >> 20 & 0x3F);
     VkFormat f = SurfaceFormat(u32(AmdGpu::RemapDataFormat(raw)), u32(AmdGpu::RemapNumberFormat(AmdGpu::NumberFormat(t[1] >> 26 & 0xF), raw)));
     if (rt.depth || !f || TexelBytes(f) != TexelBytes(rt.fmt)) f = rt.fmt;
+    const u64 key = (u64)binding << 44 | (u64)(rt.depth || storage ? 0 : t[3] & 0xFFF) << 32 | (u32)f;  // binding, DST_SEL, view format
+    // A T# smaller than the surface's image is its top-left rectangle (sub-rectangle passes such as the luminance
+    // reduction): the shader scales its coordinates into the image and bounds its texel accesses to the T#.
+    const u32 tw = std::min((t[2] & 0x3FFF) + 1, rt.w), th = std::min((t[2] >> 14 & 0x3FFF) + 1, rt.h);
+    if ((kind == 0 || kind == 1) && rt.samples == 1 && (tw < rt.w || th < rt.h)) sub = tw | th << 16 | (u64)rt.w << 32 | (u64)rt.h << 48;
+    // Fast path on existing view: skip vkGetPhysicalDeviceFormatProperties once a valid view (direct or twin) exists.
+    if (auto v = rt.views.find(key); v != rt.views.end()) {
+        if (!storage) return v->second;
+        const bool need_twin = !(rt.t.usage & VK_IMAGE_USAGE_STORAGE_BIT);
+        if (!need_twin) {
+            if ((t[3] >> 20 & 0x1F) == 8) Note("linear render target written as storage image: not written back");
+            return v->second;
+        }
+        if (dispatching && !rt.depth && rt.samples == 1 && rt.storage_copy.img) {
+            if ((t[3] >> 20 & 0x1F) == 8) Note("linear render target written as storage image: not written back");
+            twins.push_back(&rt);
+            if (stats.trace && !stats.trace_lines.empty()) stats.trace_lines.back() += " twin";
+            return v->second;
+        }
+    }
     // A storage slot writes the surface in place (a smaller T#, its top-left rectangle): identity swizzle, a view format
     // with storage support. A target the driver gave no storage usage (Intel's SRGB, even through EXTENDED_USAGE: GOW3's
     // grab copies into the scene target) is a dispatch's through a twin image in the view format, copied in and back.
@@ -2154,11 +2174,6 @@ u32 Renderer::Impl::TargetTexture(Target& rt, const u32* t, int kind, u32 bindin
         if ((t[3] >> 20 & 0x1F) == 8) Note("linear render target written as storage image: not written back");
     }
     const Tex& img = twin ? rt.storage_copy : rt.t;
-    const u64 key = (u64)binding << 44 | (u64)(rt.depth || storage ? 0 : t[3] & 0xFFF) << 32 | (u32)f;  // binding, DST_SEL, view format
-    // A T# smaller than the surface's image is its top-left rectangle (sub-rectangle passes such as the luminance
-    // reduction): the shader scales its coordinates into the image and bounds its texel accesses to the T#.
-    const u32 tw = std::min((t[2] & 0x3FFF) + 1, rt.w), th = std::min((t[2] >> 14 & 0x3FFF) + 1, rt.h);
-    if ((kind == 0 || kind == 1) && rt.samples == 1 && (tw < rt.w || th < rt.h)) sub = tw | th << 16 | (u64)rt.w << 32 | (u64)rt.h << 48;
     const u32 e = [&]() -> u32 {
         if (auto v = rt.views.find(key); v != rt.views.end()) return v->second;
         // Kinds 0/1 sample single-sampled surfaces, 4/5 multisampled ones (the T# says which the shader expects).
@@ -2246,7 +2261,7 @@ void Renderer::Impl::WriteBackTarget(const Target& t, u32 pitch, VkRect2D area) 
     if (temp_copylog) std::fprintf(stderr, "COPY WBT %llx %ux%u rect %ux%u\n", (unsigned long long)t.base, t.w, t.h, x1 - x0, y1 - y0);
     Barrier(cmd, true);  // as in WriteBack
     const u64 seq = std::atomic_ref(write_seq).fetch_add(1) + 1;
-    (in_worker ? own_writes : gpu_writes).push_back({lo, hi, seq, nullptr});
+    PushWrite({lo, hi, seq, nullptr});
 }
 
 bool Renderer::FindTarget(std::uint64_t base, Surface& out) {
@@ -2366,10 +2381,7 @@ bool Renderer::Impl::Describe(GuestTex& g, const u32* t) {
         u32 known = s->current;
         if (g.w <= s->valid_w && g.h <= s->valid_h && s->valid_frame != ~0u && (known == ~0u || s->valid_frame > known))
             known = s->valid_frame;
-        g.fresh = false, g.reload = known == ~0u;
-        const u32* at = staged_table.get();
-        for (u64 p = g.base >> 12, end = std::min((g.base + g.size + 0xFFF) >> 12, kPieces); !g.reload && p < end; ++p)
-            g.reload = at[p] > known;
+        g.fresh = false, g.reload = known == ~0u || StagedAfter(g.base, g.base + g.size, known);
     }
     g.shared = cur, g.t = *cur, g.surf = s, g.iw = s->w, g.ih = s->h, ++s->users;
     return true;
@@ -2436,8 +2448,7 @@ void Renderer::Impl::Check(GuestTex& g) {
     bool cpu = staged || (d != dirty.begin() && std::prev(d)->second > g.base);
     // Writes staged in frames it skipped are in no `dirty` it saw: the halves of the color correction LUT (01165AC0) are
     // drawn in turns, each written while the other is drawn, and one kept an old grade (the title menu's brightness flicker).
-    if (const u32* at = staged_table.get(); !cpu && g.checked != ~0u && frame - g.checked > 1)
-        for (u64 p = g.base >> 12, end = std::min((g.base + g.size + 0xFFF) >> 12, kPieces); !cpu && p < end; ++p) cpu = at[p] > g.checked;
+    if (!cpu && g.checked != ~0u && frame - g.checked > 1) cpu = StagedAfter(g.base, g.base + g.size, g.checked);
 #ifndef GOW3_OFFLINE
     if (video_serial && video_serial != g.video_serial && Gow3::GuestMemory::Readable(g.base, g.size)) {
         Gow3::GpuThread::TraceVideoCopy(g.base, frame, false);
@@ -2478,12 +2489,8 @@ void Renderer::Impl::Check(GuestTex& g) {
             s.current = s.valid_frame = frame, s.valid_w = s.w, s.valid_h = s.h;
         } else if (s.valid_frame == ~0u || (g.w >= s.valid_w && g.h >= s.valid_h)) {
             s.valid_frame = frame, s.valid_w = g.w, s.valid_h = g.h;
-        } else {
-            const u32* at = staged_table.get();
-            bool stale = false;
-            for (u64 p = g.base >> 12, end = std::min((g.base + g.size + 0xFFF) >> 12, kPieces); !stale && p < end; ++p)
-                stale = at[p] > s.valid_frame;
-            if (stale) s.valid_frame = frame, s.valid_w = g.w, s.valid_h = g.h;
+        } else if (StagedAfter(g.base, g.base + g.size, s.valid_frame)) {
+            s.valid_frame = frame, s.valid_w = g.w, s.valid_h = g.h;
         }
     }
     std::atomic_ref(g.checked).store(frame, std::memory_order_release);
@@ -2494,33 +2501,39 @@ void Renderer::Impl::Check(GuestTex& g) {
 // the upload for those to Submit, which makes it once per version ahead of the blocks that need it.
 void Renderer::Impl::Resync(GuestTex& g) {
     const size_t seen = std::min(horizon, gpu_writes.size());
+    const bool in_gpu = seen && gpu_writes_lo < g.base + g.size && gpu_writes_hi > g.base;
+    const bool in_own = !own_writes.empty() && own_writes_lo < g.base + g.size && own_writes_hi > g.base;
+    if (!in_gpu && !in_own) return;
+    const size_t n_gpu = in_gpu ? seen : 0, n_own = in_own ? own_writes.size() : 0;
     auto over = [&](const GpuWrite& w) { return w.lo < g.base + g.size && w.hi > g.base && (!w.by || w.by->t.img != g.t.img); };  // in another image
-    if (std::none_of(gpu_writes.begin(), gpu_writes.begin() + seen, over) && std::none_of(own_writes.begin(), own_writes.end(), over)) return;
+    if ((!n_gpu || std::none_of(gpu_writes.begin(), gpu_writes.begin() + n_gpu, over)) &&
+        (!n_own || std::none_of(own_writes.begin(), own_writes.end(), over)))
+        return;
     u64& synced = synced_here ? synced_here->try_emplace(&g, std::min(g.synced, frame_seq)).first->second : g.synced;
     // Writes left in their image go to the mirror first; a reader outside their surface makes it write back at once.
     auto learn = [&](const GpuWrite& w) { return !g.surf || !w.by || w.by->surf != g.surf; };
     if (block_now) {
         u64 need = 0;
-        for (size_t k = 0; k < seen; ++k)
+        for (size_t k = 0; k < n_gpu; ++k)
             if (over(gpu_writes[k])) need = std::max(need, gpu_writes[k].seq);
         if (need > synced && temp_copylog)
-            for (size_t k = 0; k < seen; ++k)
+            for (size_t k = 0; k < n_gpu; ++k)
                 if (over(gpu_writes[k]) && gpu_writes[k].seq > synced) TempCopy("RS", g, TempWriter(gpu_writes[k], g));
         if (need > synced) {  // the block's own writes come after these
-            for (size_t k = 0; k < seen; ++k)
+            for (size_t k = 0; k < n_gpu; ++k)
                 if (const GpuWrite& w = gpu_writes[k]; w.lazy && over(w) && w.seq > synced) block_now->lazy.push_back({w, learn(w)});
             block_now->resync.push_back({&g, need}), synced = need;
         }
         if (need && !table_ps) block_now->resync_vs.push_back(&g);
     }
-    for (size_t k = 0; k < seen + own_writes.size(); ++k)
-        if (const GpuWrite& w = k < seen ? gpu_writes[k] : own_writes[k - seen]; over(w) && w.seq > synced) {
+    for (size_t k = 0; k < n_gpu + n_own; ++k)
+        if (const GpuWrite& w = k < n_gpu ? gpu_writes[k] : own_writes[k - n_gpu]; over(w) && w.seq > synced) {
             if (temp_copylog) TempCopy("RS-inline", g, TempWriter(w, g));
             EndRendering();
             std::scoped_lock res(res_lock);
             bool fenced = false;
-            for (size_t j = 0; j < seen + own_writes.size(); ++j)
-                if (const GpuWrite& x = j < seen ? gpu_writes[j] : own_writes[j - seen]; x.lazy && over(x) && x.seq > synced) {
+            for (size_t j = 0; j < n_gpu + n_own; ++j)
+                if (const GpuWrite& x = j < n_gpu ? gpu_writes[j] : own_writes[j - n_gpu]; x.lazy && over(x) && x.seq > synced) {
                     if (!fenced) Barrier(cmd), fenced = true;
                     Materialize(cmd, x, learn(x));
                 }
@@ -3009,13 +3022,14 @@ void Renderer::Impl::WriteBack() {
         if (temp_copylog) TempCopy(lazy ? "WB-lazy" : linear ? "WB-linear" : "WB-tiled", g, std::format(" | mip {} {:.2f} MB", m, l.size / 1048576.0));
         const u64 seq = std::atomic_ref(write_seq).fetch_add(1) + 1;
         const GpuWrite w{g.base + l.offset, g.base + l.offset + l.size, seq, &g, lazy};
+        PushWrite(w);
         if (in_worker) {
-            own_writes.push_back(w), (*synced_here)[&g] = seq;
+            (*synced_here)[&g] = seq;
             std::scoped_lock nl(note_lock);
             storage_draw_progs.insert(draw_ps_addr ^ (draw_vs_addr * 0x9E3779B97F4A7C15ull));
             has_storage_draw_progs.store(true, std::memory_order_relaxed);
         } else {
-            gpu_writes.push_back(w), g.synced = seq;
+            g.synced = seq;
         }
     }
     stores.clear();
@@ -3171,10 +3185,7 @@ bool Renderer::Impl::TryLinearCopyDispatch(const u32* b, const CpuRead& cpu) {
         contiguous && !stats.trace && !boom_on && !in_worker &&
         Gow3::GpuThread::InTextureHeap(src_lo, src_hi) && Gow3::GpuThread::InTextureHeap(dst_lo, dst_hi) &&
         !(src_lo < marked_hi && marked_lo < src_hi) && !(dst_lo < marked_hi && marked_lo < dst_hi) &&
-        std::none_of(flight.back.begin(), flight.back.end(), [&](const VkBufferCopy& cf) {
-            const u64 clo = cf.srcOffset, chi = clo + cf.size;
-            return (clo < src_hi && chi > src_lo) || (clo < dst_hi && chi > dst_lo);
-        }) &&
+        !OverlapsRanges(flight.back_ranges, src_lo, src_hi) && !OverlapsRanges(flight.back_ranges, dst_lo, dst_hi) &&
         !over_writes(gpu_writes, src_lo, src_hi, true) && !over_writes(gpu_writes, dst_lo, dst_hi, true) &&
         !over_writes(last_writes, src_lo, src_hi, true) && !over_writes(last_writes, dst_lo, dst_hi, true) &&
         !over_writes(own_writes, src_lo, src_hi, true) && !over_writes(own_writes, dst_lo, dst_hi, true) &&
@@ -3197,7 +3208,7 @@ bool Renderer::Impl::TryLinearCopyDispatch(const u32* b, const CpuRead& cpu) {
             !over_writes(own_writes, dst_lo, dst_hi, false)) {
             Gow3::GuestMemory::CopyBacking(dst_lo, reinterpret_cast<const void*>(src_lo), copy_bytes, false);
             InvalidateBlocks(dst_lo, copy_bytes);
-            for (u64 pg = dst_lo >> 12, end = std::min((dst_hi + 0xFFF) >> 12, kPieces); pg < end; ++pg) staged_table.get()[pg] = frame;
+            MarkStaged(dst_lo, dst_hi);
             Count(stats.dispatches);
             return true;
         }
@@ -3219,7 +3230,7 @@ bool Renderer::Impl::TryLinearCopyDispatch(const u32* b, const CpuRead& cpu) {
                 vkCmdCopyBuffer(cmd, (use_stage_dev ? stage_dev : stage)[sp.chunk].buf, mirror, 1, &region);
                 Barrier(cmd);
                 const u64 seq = std::atomic_ref(write_seq).fetch_add(1) + 1;
-                gpu_writes.push_back({dst_lo, dst_hi, seq, nullptr, false, true});
+                PushGpuWrite({dst_lo, dst_hi, seq, nullptr, false, true});
                 if (has_pending_parallel) lin_syncs.push_back({dst_lo, src_lo, copy_bytes});
                 else SyncLinearBacking(dst_lo, src_lo, copy_bytes);
                 Count(stats.dispatches);
@@ -3236,7 +3247,7 @@ bool Renderer::Impl::TryLinearCopyDispatch(const u32* b, const CpuRead& cpu) {
         vkCmdCopyBuffer(cmd, mirror, mirror, 1, &region);
         Barrier(cmd);
         const u64 seq = std::atomic_ref(write_seq).fetch_add(1) + 1;
-        gpu_writes.push_back({dst_lo, dst_hi, seq, nullptr, false, true});
+        PushGpuWrite({dst_lo, dst_hi, seq, nullptr, false, true});
         if (has_pending_parallel) lin_syncs.push_back({dst_lo, src_lo, copy_bytes});
         else SyncLinearBacking(dst_lo, src_lo, copy_bytes);
         Count(stats.dispatches);
@@ -3258,7 +3269,7 @@ bool Renderer::Impl::TryLinearCopyDispatch(const u32* b, const CpuRead& cpu) {
     vkCmdCopyBuffer(cmd, mirror, mirror, (u32)regions.size(), regions.data());
     Barrier(cmd);
     const u64 seq = std::atomic_ref(write_seq).fetch_add(1) + 1;
-    (in_worker ? own_writes : gpu_writes).push_back({dst_lo, dst_hi, seq, nullptr});
+    PushWrite({dst_lo, dst_hi, seq, nullptr});
     Count(stats.dispatches);
     return true;
 }

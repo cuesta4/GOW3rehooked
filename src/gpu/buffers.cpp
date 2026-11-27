@@ -452,7 +452,7 @@ void Renderer::Write(std::span<WriteRange> ranges) {
         }
     }
     // The hashes (0: the frame in flight writes there) on every recording thread, unless this one is recording.
-    const auto& inflight = d->flight.back;
+    const auto& inflight = d->flight.back_ranges;
     const auto changed_blocks = [](u32 mask, auto fn) {
         while (mask) {
             const u32 b = std::countr_zero(mask), n = std::countr_one(mask >> b);
@@ -466,7 +466,7 @@ void Renderer::Write(std::span<WriteRange> ranges) {
         alignas(64) u8 snapshot[0x1000];  // reused in this worker's L1; the guest bytes are read only once
         for (size_t k; (k = next.fetch_add(32, std::memory_order_relaxed)) < pieces.size();)
             for (Piece& q : std::span(pieces).subspan(k, std::min<size_t>(32, pieces.size() - k))) {
-                if (std::any_of(inflight.begin(), inflight.end(), [&](const VkBufferCopy& c) { return q.a < c.srcOffset + c.size && c.srcOffset < q.a + q.n; })) q.h = 0;
+                if (Impl::OverlapsRanges(inflight, q.a, q.a + q.n)) q.h = 0;
                 else if (q.capture == ~0ull) q.h = Impl::PieceHash(q.p, q.n);
                 else {
                     q.previous = q.h;
@@ -553,7 +553,7 @@ void Renderer::Write(std::span<WriteRange> ranges) {
 // Live linear readback: the frame's GPU writes, mirror -> host, handed to the caller when the frame retires. With the
 // copy engine's second queue: mirror -> rb_dev here (VRAM), rb_dev -> host there once the frame is done. Returns the bytes.
 u64 Renderer::Impl::RecordReadback(const VkCommandBufferBeginInfo& bi) {
-    back.clear();
+    back.clear(), back_ranges.clear();
     u64 rb_total = 0;
     if (readback)
         for (auto& w : gpu_writes)  // a write left in its image has not reached the mirror (tiled: the CPU does not read it)
@@ -584,6 +584,16 @@ u64 Renderer::Impl::RecordReadback(const VkCommandBufferBeginInfo& bi) {
             back.clear();
             return 0;
         }
+        back_ranges.reserve(back.size());
+        for (const VkBufferCopy& c : back)
+            if (c.size) back_ranges.push_back({c.srcOffset, c.srcOffset + c.size});
+        std::sort(back_ranges.begin(), back_ranges.end());
+        size_t merged_rb = 0;
+        for (auto r : back_ranges)
+            if (merged_rb && r.first <= back_ranges[merged_rb - 1].second)
+                back_ranges[merged_rb - 1].second = std::max(back_ranges[merged_rb - 1].second, r.second);
+            else back_ranges[merged_rb++] = r;
+        back_ranges.resize(merged_rb);
         TempLabel(primary, "readback");  // TEMP perf
         vkCmdCopyBuffer(primary, mirror, (rbq ? rb_dev : rb).buf, (u32)back.size(), back.data());
         TempLabelEnd(primary);  // TEMP perf

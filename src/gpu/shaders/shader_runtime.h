@@ -48,6 +48,8 @@ struct ProgMemo {
     u64 orb_hash = 0;
     int fetch_sgpr = -1;
     u64 ver = 0;  // Version of the code's pages when it was read (0: read it again every frame)
+    u64 blend_key = ~0ull;  // cached BlendShaderSafe key (rsrc2 << 8 | layout & 0xFF); ~0ull = unchecked
+    bool blend_safe = false;
 };
 
 inline constexpr u64 kMotionBlurPassOrbHash = 0x107d87f9d56574cfULL;
