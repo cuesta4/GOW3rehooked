@@ -632,6 +632,11 @@ struct Renderer::Impl {
     std::vector<GpuWrite> last_writes;  // the last frame's: textures over them in another image are uploaded again
     std::vector<GpuWrite> lazy_writes;  // earlier frames' lazy ones not written back yet (one per image and range)
     std::vector<std::pair<GpuWrite, bool>> prologue_lazy;  // those the frame's prologue writes back before its uploads (Check; `learn`)
+    void QueuePrologueLazy(const GpuWrite& w, bool learn) {
+        for (auto& p : prologue_lazy)
+            if (p.first.by == w.by && p.first.lo == w.lo) return void(p.second |= learn);
+        prologue_lazy.push_back({w, learn});
+    }
     std::vector<GpuWrite> block_writes;  // this frame's parallel blocks' (they join gpu_writes after recording)
     u64 write_seq = 0, frame_seq = 0;  // frame_seq: write_seq when the frame started
     // Images made this frame (targets): to GENERAL and cleared in the frame's prologue, before any block
