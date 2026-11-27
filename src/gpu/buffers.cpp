@@ -406,8 +406,9 @@ void Renderer::Write(std::span<WriteRange> ranges) {
         u64 a, n, h;
         const u8* p;
         WriteRange* w;
-        u64 capture;
-        bool copied = false;
+        bool capture = false;
+        u32 cap_chunk = ~0u;
+        u64 cap_src = 0;
         Impl::BlockHashes* blocks = nullptr;
         u64 previous = 0, hashes[0x1000 / Gpu::PieceHash::kMemoryBlock]{};
         u32 mask = 0, want = 0xFF;  // blocks: changed, offered
@@ -416,7 +417,6 @@ void Renderer::Write(std::span<WriteRange> ranges) {
     static thread_local std::vector<Piece> own;
     std::vector<Piece>& pieces = own;  // the caller's, on every thread
     pieces.clear();
-    u64 capture_size = 0;
     static std::atomic<bool> above_fallback{false};  // logged once, outside debug runs too
     for (WriteRange& w : ranges) {
         const u64 top = d->mirror_size;  // the mirror holds guest addresses below it (32 GB, or 16 GB)
@@ -429,26 +429,12 @@ void Renderer::Write(std::span<WriteRange> ranges) {
             n = std::min<u64>(0x1000 - (a & 0xFFF), end - a);
             const u32 want = w.blocks && n == 0x1000 ? u32(w.blocks[(a - w.addr) >> 15] >> ((a - w.addr) >> 9 & 63) & 0xFF) : 0xFF;
             if (!want) continue;  // no block of the page asked for
-            pieces.push_back({a, n, w.capture ? d->WrittenSlot(a, n) : 0, (const u8*)w.data + (a - w.addr), &w, w.capture ? capture_size : ~0ull});
+            pieces.push_back({a, n, w.capture ? d->WrittenSlot(a, n) : 0, (const u8*)w.data + (a - w.addr), &w, w.capture});
             if (w.capture && n == 0x1000) {
                 auto& b = d->written_blocks[a >> 20];
                 if (!b) b = std::make_unique<Impl::BlockHashes[]>(256);
                 pieces.back().blocks = &b[(a >> 12) & 255], pieces.back().want = want;
             }
-            if (w.capture) capture_size = (capture_size + n + 63) & ~63ull;
-        }
-    }
-    Impl::Pending capture{};
-    u8* captured = nullptr;
-    if (capture_size) {
-        std::scoped_lock lock(d->stage_lock);
-        capture = d->AllocateStage(capture_size);
-        if (capture.chunk != ~0u) {
-            captured = d->stage[capture.chunk].ptr + capture.src;
-        } else {
-            d->Note("staging capture allocation failed");
-            capture_size = 0;
-            for (Piece& q : pieces) q.capture = ~0ull, q.blocks = nullptr;
         }
     }
     // The hashes (0: the frame in flight writes there) on every recording thread, unless this one is recording.
@@ -464,10 +450,15 @@ void Renderer::Write(std::span<WriteRange> ranges) {
     const std::function<void(u32)> hash = [&](u32) {
         RenderProbe::Scope hash_time(RenderProbe::Hash, true);
         alignas(64) u8 snapshot[0x1000];  // reused in this worker's L1; the guest bytes are read only once
-        for (size_t k; (k = next.fetch_add(32, std::memory_order_relaxed)) < pieces.size();)
-            for (Piece& q : std::span(pieces).subspan(k, std::min<size_t>(32, pieces.size() - k))) {
+        static thread_local std::vector<u8> batch_buf;
+        if (batch_buf.size() < 32 * 0x1000) batch_buf.resize(32 * 0x1000);
+        bool any_wc = false;
+        for (size_t k; (k = next.fetch_add(32, std::memory_order_relaxed)) < pieces.size();) {
+            auto batch = std::span(pieces).subspan(k, std::min<size_t>(32, pieces.size() - k));
+            u32 batch_used = 0;
+            for (Piece& q : batch) {
                 if (Impl::OverlapsRanges(inflight, q.a, q.a + q.n)) q.h = 0;
-                else if (q.capture == ~0ull) q.h = Impl::PieceHash(q.p, q.n);
+                else if (!q.capture) q.h = Impl::PieceHash(q.p, q.n);
                 else {
                     q.previous = q.h;
                     if (q.blocks) {
@@ -491,17 +482,44 @@ void Renderer::Write(std::span<WriteRange> ranges) {
                             q.mask |= (u32(~_mm_movemask_pd(_mm_castsi128_pd(_mm_cmpeq_epi64(old, now)))) & 3) << b;
                         }
 #endif
-                        changed_blocks(q.mask, [&](u64 o, u64 n) { std::memcpy(captured + q.capture + o, snapshot + o, n); });
-                        if (!q.mask) q.h = q.previous;
-                        else if (q.h == q.previous) q.h ^= 2;
-                        q.copied = q.mask != 0;
+                        if (q.mask) {
+                            q.cap_src = batch_used, q.cap_chunk = 0;
+                            changed_blocks(q.mask, [&](u64 o, u64 n) {
+                                std::memcpy(batch_buf.data() + batch_used, snapshot + o, n);
+                                batch_used += (u32)n;
+                            });
+                            if (q.h == q.previous) q.h ^= 2;
+                        } else q.h = q.previous;
                     } else {
                         q.h = Gpu::PieceHash::Copy(snapshot, q.p, q.n);
-                        if (q.h != q.previous) std::memcpy(captured + q.capture, snapshot, q.n), q.copied = true;
+                        if (q.h != q.previous) {
+                            q.cap_src = batch_used, q.cap_chunk = 0;
+                            std::memcpy(batch_buf.data() + batch_used, snapshot, q.n);
+                            batch_used += (u32)q.n;
+                        }
                     }
                 }
             }
-        if (capture_size) _mm_sfence();  // publish WC stores before the worker signals completion
+            if (batch_used) {
+                Impl::Pending bp{};
+                u8* dst = nullptr;
+                {
+                    std::scoped_lock lock(d->stage_lock);
+                    bp = d->AllocateStage(batch_used);
+                    if (bp.chunk != ~0u) dst = d->stage[bp.chunk].ptr + bp.src;
+                }
+                if (dst) {
+                    std::memcpy(dst, batch_buf.data(), batch_used);
+                    any_wc = true;
+                    for (Piece& q : batch)
+                        if (q.cap_chunk != ~0u) q.cap_chunk = bp.chunk, q.cap_src += bp.src;
+                } else {
+                    d->Note("staging capture allocation failed");
+                    for (Piece& q : batch) q.cap_chunk = ~0u;
+                }
+            }
+        }
+        if (any_wc) _mm_sfence();  // publish WC stores before the worker signals completion
     };
     if (pieces.size() > 64 && !Impl::in_worker) d->Parallel(hash);
     else hash(0);
@@ -509,31 +527,43 @@ void Renderer::Write(std::span<WriteRange> ranges) {
     for (const Piece& q : pieces) {
         u64* w = q.h ? &d->WrittenSlot(q.a, q.n) : nullptr;
         const bool changed = w && *w != q.h;
+        const bool copied = q.cap_chunk != ~0u;
         // Earlier overlapping writes may have invalidated the block comparisons made by the workers.
-        const bool fused = changed && q.copied && (!q.blocks || q.mask == (1u << std::size(q.hashes)) - 1 ||
-                                                  (*w == q.previous && q.blocks->witness == q.witness));
-        const u64 staged = q.copied ? (q.blocks ? std::popcount(q.mask) * Gpu::PieceHash::kMemoryBlock : q.n) : 0;
+        const bool fused = changed && copied && (!q.blocks || q.mask == (1u << std::size(q.hashes)) - 1 ||
+                                                 (*w == q.previous && q.blocks->witness == q.witness));
+        const u64 staged = copied ? (q.blocks ? std::popcount(q.mask) * Gpu::PieceHash::kMemoryBlock : q.n) : 0;
         RenderProbe::Piece(q.a, q.blocks ? std::popcount(q.want) * Gpu::PieceHash::kMemoryBlock : q.n,
                            !w ? RenderProbe::InFlight : !changed ? RenderProbe::Same : *w ? RenderProbe::Changed : RenderProbe::New, false, fused, staged);
         if (changed) {
             q.w->changed = true;
             const u8* copy;
             if (fused) {
-                std::scoped_lock lock(d->stage_lock);
-                if (q.blocks) {
-                    changed_blocks(q.mask, [&](u64 o, u64 n) { d->QueueStage({q.a + o, n, capture.src + q.capture + o, capture.chunk}); });
-                    q.blocks->witness = q.h;
-                    std::copy(std::begin(q.hashes), std::end(q.hashes), q.blocks->hashes);
-                } else d->QueueStage({q.a, q.n, capture.src + q.capture, capture.chunk});
-                *w = q.h, copy = captured + q.capture;
+                {
+                    std::scoped_lock lock(d->stage_lock);
+                    if (q.blocks) {
+                        u64 packed = q.cap_src;
+                        changed_blocks(q.mask, [&](u64 o, u64 n) { d->QueueStage({q.a + o, n, packed, q.cap_chunk}), packed += n; });
+                        q.blocks->witness = q.h;
+                        std::copy(std::begin(q.hashes), std::end(q.hashes), q.blocks->hashes);
+                    } else d->QueueStage({q.a, q.n, q.cap_src, q.cap_chunk});
+                    *w = q.h;
+                }
+                copy = d->stage[q.cap_chunk].ptr + q.cap_src;
             } else copy = d->Stage(q.a, q.p, q.n, w);
             if (!copy) continue;
             if (!q.blocks && *w != q.h) RenderProbe::Piece(q.a, q.n, RenderProbe::Changed, true);
             if (Impl::boom_on) {
-                const u64 step = q.blocks && copy == captured + q.capture ? Gpu::PieceHash::kMemoryBlock : q.n;
-                for (u64 o = 0; o < q.n; o += step)
-                    if ((step == q.n || (q.mask & (1u << (o / step)))) && std::memcmp(copy + o, q.p + o, step))
-                        d->NoteTear(q.a + o, copy + o, q.p + o, step);
+                if (fused && q.blocks) {
+                    u64 packed = 0;
+                    changed_blocks(q.mask, [&](u64 o, u64 n) {
+                        for (u64 b = 0; b < n; b += Gpu::PieceHash::kMemoryBlock)
+                            if (std::memcmp(copy + packed + b, q.p + o + b, Gpu::PieceHash::kMemoryBlock))
+                                d->NoteTear(q.a + o + b, copy + packed + b, q.p + o + b, Gpu::PieceHash::kMemoryBlock);
+                        packed += n;
+                    });
+                } else if (std::memcmp(copy, q.p, q.n)) {
+                    d->NoteTear(q.a, copy, q.p, q.n);
+                }
             }
             // Part of a page changed: so did the page for Version (its whole piece is staged again at its next offer).
             if (q.n != 0x1000) {
