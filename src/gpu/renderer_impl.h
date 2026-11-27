@@ -326,7 +326,6 @@ struct Renderer::Impl {
     std::vector<VkDeviceMemory> chunks;
     u64 chunk_size = kChunk;
     u64 chunk_used = kChunk;
-    bool chunk_failed = false;  // a chunk allocation failed (logged once)
     std::vector<u64> bound;  // bitmap of mirror pages with memory
     std::vector<VkSparseMemoryBind> pending_binds;
     std::atomic<u64> mirror_chunks{0}, device_buffers{0}, host_buffers{0};  // debug: Vulkan memory held (bytes)

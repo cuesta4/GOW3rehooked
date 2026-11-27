@@ -263,15 +263,10 @@ void Renderer::Impl::BindPages(u64 lo, u64 hi) {
         if (word & bit) continue;
         word |= bit;
         if (chunk_used + page > chunk_size) {
-            VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
-            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags, chunk_size, DeviceType(mirror_bits, chunk_size)};
-            VkDeviceMemory m = VK_NULL_HANDLE;
-            if (const VkResult e = vkAllocateMemory(dev, &ai, nullptr, &m); e != VK_SUCCESS) {
+            const VkMemoryRequirements req{chunk_size, page, mirror_bits};
+            const VkDeviceMemory m = Alloc(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
+            if (!m) {
                 word &= ~bit;  // the rest stays without memory (reads zero); the next write there tries again
-                alloc_pressure.store(true, std::memory_order_relaxed);
-                if (!chunk_failed)
-                    chunk_failed = true, Gow3::Log(std::format("Renderer: vkAllocateMemory {} for the guest mirror (type {}, {} MB held)", (int)e,
-                                                               (int)ai.memoryTypeIndex, mirror_chunks.load() >> 20));
                 break;
             }
             chunks.push_back(m), chunk_used = 0, mirror_chunks += chunk_size;
