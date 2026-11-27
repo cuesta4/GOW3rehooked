@@ -388,7 +388,7 @@ ShaderRef Renderer::Impl::Translated(Gcn::Stage stage, u64 prog, const CpuRead& 
     return memo[key] = {ref, out_mask}, shaders[key] = ref;
 }
 
-Renderer::Impl::ProgMemo& Renderer::Impl::RefreshProgMemo(Gcn::Stage stage, u64 prog, const CpuRead& cpu) {
+ProgMemo& Renderer::Impl::RefreshProgMemo(Gcn::Stage stage, u64 prog, const CpuRead& cpu) {
 #ifndef GOW3_OFFLINE
     if (const u32 gen = Gow3::GuestMemory::Generation(); prog_memo_gen != gen)
         prog_memo.clear(), fetch_memo.clear(), prog_memo_gen = gen;
