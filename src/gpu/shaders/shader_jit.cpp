@@ -337,8 +337,8 @@ std::shared_future<CompiledPipeline> Renderer::Impl::AsyncPipeline(u64 h, Shader
                 const VkPipeline foi_sq = need_sq ? GetGplFragOutput(state, true) : VK_NULL_HANDLE;
                 if (vi && prerast && fs && foi && (!need_sq || foi_sq)) {
                     const VkPipeline libs[4]{vi, prerast, fs, foi};
-                    if (caps.cache_control && probe) pl = LinkGplPair(libs, foi_sq, true, true);
-                    if (!pl.main) pl = LinkGplPair(libs, foi_sq, true, false), origin = urgent ? kPlGplLto : kPlAhead;
+                    if (probe) pl = LinkGplPair(libs, foi_sq, GplLink::CachedLto);
+                    if (!pl.main) pl = LinkGplPair(libs, foi_sq, GplLink::Unoptimized), origin = urgent ? kPlGplLink : kPlAhead;
                 }
             }
             if (!pl.main) {
@@ -475,30 +475,6 @@ bool Renderer::Impl::ExtractDiscoverPipelineState(bool rect, bool rect_vs, bool 
                 (has_ps ? FixedPipelineState::kHasPs : 0) |
                 ((rect && !rect_vs) ? FixedPipelineState::kHasGs : 0);
     return true;
-}
-
-void Renderer::Impl::EnqueueGplLto(u64 h, const VkPipeline (&libs)[4], VkPipeline foi_sq) {
-    {
-        std::unique_lock lock(prog_lock);
-        if (!gpl_lto_queued.insert(h).second) return;
-    }
-    Queue([this, h, l0 = libs[0], l1 = libs[1], l2 = libs[2], l3 = libs[3], foi_sq] {
-        const auto t = std::chrono::steady_clock::now();
-        const VkPipeline main_libs[4]{l0, l1, l2, l3};
-        const CompiledPipeline pl = LinkGplPair(main_libs, foi_sq, true, false);
-        if (!pl.main) return;
-        const u32 us = u32(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t).count());
-        std::unique_lock lock(prog_lock);
-        if (auto it = pipelines.find(h); it != pipelines.end()) {
-            if (it->second.main) retired_pipelines.push_back(it->second.main);
-            if (it->second.square) retired_pipelines.push_back(it->second.square);
-            it->second = pl;
-            std::atomic_ref(pipeline_epoch).fetch_add(1, std::memory_order_release);
-        } else {
-            pipelines.emplace(h, pl);
-        }
-        if (temp_pipelog) TempPlOrigin(h, kPlGplLto, us);
-    }, 1);
 }
 
 void Renderer::Impl::EnqueuePipeline(u64 vs_key, u64 ps_key, bool has_gs, const FixedPipelineState& raw_state) {

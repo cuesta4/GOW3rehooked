@@ -1142,31 +1142,33 @@ VkPipeline Renderer::Impl::GetGplFragOutput(const FixedPipelineState& state, boo
     return it->second;
 }
 
-VkPipeline Renderer::Impl::LinkGplPipeline(const VkPipeline (&libs)[4], bool lto, bool fail_on_compile) {
-    if (fail_on_compile && !caps.cache_control) return VK_NULL_HANDLE;
+VkPipeline Renderer::Impl::LinkGplPipeline(const VkPipeline (&libs)[4], GplLink mode) {
+    const bool cached = mode == GplLink::CachedLto;
+    const bool lto = mode != GplLink::Unoptimized;
+    if (cached && !caps.cache_control) return VK_NULL_HANDLE;
     VkPipelineLibraryCreateInfoKHR lib_ci{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, nullptr, 4, libs};
     VkPipelineCreateFlags flags = 0;
     if (lto) flags |= VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
-    if (fail_on_compile) flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+    if (cached) flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
     VkGraphicsPipelineCreateInfo gi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &lib_ci, flags};
     gi.layout = layout;
     VkPipeline pl = VK_NULL_HANDLE;
     const VkResult e = vkCreateGraphicsPipelines(dev, pipeline_cache, 1, &gi, nullptr, &pl);
     if (e == VK_SUCCESS) {
-        if (lto && !fail_on_compile) pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed);
+        if (mode == GplLink::BuildLto) pipeline_cache_dirty.fetch_add(1, std::memory_order_relaxed);
         return pl;
     }
     if (e < 0) Report(std::format("vkCreateGraphicsPipelines GPL Link(lto={}) {}", lto, (int)e));
     return VK_NULL_HANDLE;
 }
 
-CompiledPipeline Renderer::Impl::LinkGplPair(const VkPipeline (&main_libs)[4], VkPipeline foi_square, bool lto, bool fail_on_compile) {
+CompiledPipeline Renderer::Impl::LinkGplPair(const VkPipeline (&main_libs)[4], VkPipeline foi_square, GplLink mode) {
     CompiledPipeline pl{};
-    pl.main = LinkGplPipeline(main_libs, lto, fail_on_compile);
+    pl.main = LinkGplPipeline(main_libs, mode);
     if (!pl.main) return {};
     if (foi_square) {
         const VkPipeline sq_libs[4]{main_libs[0], main_libs[1], main_libs[2], foi_square};
-        pl.square = LinkGplPipeline(sq_libs, lto, fail_on_compile);
+        pl.square = LinkGplPipeline(sq_libs, mode);
         if (!pl.square) {
             vkDestroyPipeline(dev, pl.main, nullptr);
             return {};
@@ -1200,16 +1202,11 @@ CompiledPipeline Renderer::Impl::GetGraphicsPipeline(const ShaderRef& vs, const 
         const VkPipeline foi_sq = need_sq ? GetGplFragOutput(gkey.state, true) : VK_NULL_HANDLE;
         if (vi && prerast && fs && foi && (!need_sq || foi_sq)) {
             const VkPipeline libs[4]{vi, prerast, fs, foi};
-            CompiledPipeline pl = LinkGplPair(libs, foi_sq, true, true);
+            CompiledPipeline pl = LinkGplPair(libs, foi_sq, GplLink::CachedLto);
             const PlOrigin origin = pl.main ? kPlGplLto : kPlGplLink;
             if (!pl.main && (caps.gpl_fast_link || stats.trace || Jit::mode != Jit::Mode::Async))
-                pl = LinkGplPair(libs, foi_sq, false, false);
-            if (pl.main) {
-                const CompiledPipeline kept = KeepPipeline(h, pl, origin);
-                if (origin == kPlGplLink && !stats.trace && caps.gpl_fast_link && kept.main == pl.main)
-                    EnqueueGplLto(h, libs, foi_sq);
-                return pm[rh] = kept;
-            }
+                pl = LinkGplPair(libs, foi_sq, GplLink::Unoptimized);
+            if (pl.main) return pm[rh] = KeepPipeline(h, pl, origin);
         }
     }
     // A pipeline in the pipeline cache (built by the AOT or an earlier run) still costs the driver a load. Async: the load
@@ -1360,7 +1357,7 @@ void Renderer::Impl::WarmPipelines() {
             const VkPipeline foi_sq = need_sq ? GetGplFragOutput(gk.state, true) : VK_NULL_HANDLE;
             if (vi && prerast && fs && foi && (!need_sq || foi_sq)) {
                 const VkPipeline libs[4]{vi, prerast, fs, foi};
-                pl = LinkGplPair(libs, foi_sq, true, true);
+                pl = LinkGplPair(libs, foi_sq, GplLink::CachedLto);
             }
         } else {
             pl = CreateMonolithicPipeline(vs, ps, gs, gk.state, true);

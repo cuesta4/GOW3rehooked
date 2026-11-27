@@ -753,7 +753,7 @@ void Renderer::Impl::AotBuild() {
                     return;
                 }
                 const VkPipeline libs[4]{vi, prerast, fs, foi};
-                if (const CompiledPipeline hit = LinkGplPair(libs, foi_sq, true, true); hit.main) {
+                if (const CompiledPipeline hit = LinkGplPair(libs, foi_sq, GplLink::CachedLto); hit.main) {
                     vkDestroyPipeline(dev, hit.main, nullptr);
                     if (hit.square) vkDestroyPipeline(dev, hit.square, nullptr);
                     ++pl_cached;
@@ -766,7 +766,7 @@ void Renderer::Impl::AotBuild() {
                     return;
                 }
                 std::call_once(aot_begin_once, Gow3::BeginAotBuild);
-                if (const CompiledPipeline built = LinkGplPair(libs, foi_sq, true, false); built.main) {
+                if (const CompiledPipeline built = LinkGplPair(libs, foi_sq, GplLink::BuildLto); built.main) {
                     vkDestroyPipeline(dev, built.main, nullptr);
                     if (built.square) vkDestroyPipeline(dev, built.square, nullptr);
                     ++pl_compiled;

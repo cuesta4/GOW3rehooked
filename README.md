@@ -133,6 +133,8 @@ GOW3rehooked translates the game's shaders before gameplay instead, behind a pro
 
 JIT (just in time) translates a shader when the game first needs it. With AOT it stays active as a safety net for any shader the preparation didn't catch, so nothing goes missing. It can also be used alone, with no preparation screen. Holding Esc, Circle (PlayStation controllers) or B (other gamepads) on the preparation screen skips it, and the game then restarts once with JIT alone.
 
+On GPUs that support fast pipeline linking, the renderer builds new graphics pipelines quickly during play. It records the pipelines it encounters so that the next AOT preparation after restarting can optimize them.
+
 Both modes are described under [Settings](#settings).
 
 <p align="center"><img src="assets/screenshots/shader-preparation.png" alt="Shader preparation screen with a progress bar and a hold-to-skip prompt" width="80%"></p>

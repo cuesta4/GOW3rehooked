@@ -768,7 +768,6 @@ struct Renderer::Impl {
     struct Memo {
         const Impl* owner = nullptr;
         u64 epoch = ~0ull;
-        u64 pipeline_epoch = ~0ull;
         Flat<MemoTarget> targets;
         Flat<MemoAttach> target_attach;
         Flat<u32> samplers;
@@ -778,13 +777,11 @@ struct Renderer::Impl {
         Flat<ProgUse> progs;                     // program key -> its slots and last inputs
     };
     static thread_local Memo memo;
-    u64 epoch = 0, pipeline_epoch = 0;
+    u64 epoch = 0;
     Memo& Memos() {
         if (memo.owner != this) memo = {}, memo.owner = this;
         if (const u64 e = std::atomic_ref(epoch).load(std::memory_order_acquire); memo.epoch != e)
             memo.tex.clear(), memo.targets.clear(), memo.target_attach.clear(), memo.epoch = e;
-        if (const u64 pe = std::atomic_ref(pipeline_epoch).load(std::memory_order_acquire); memo.pipeline_epoch != pe)
-            memo.pipelines.clear(), memo.pipeline_epoch = pe;
         return memo;
     }
     static inline thread_local bool table_ps = false;  // the table being built is a pixel shader's
@@ -826,8 +823,6 @@ struct Renderer::Impl {
     std::mutex pipeline_cache_save_lock;
     size_t pipeline_cache_bytes = 0;  // the last save's (or load's) size, under pipeline_cache_save_lock
     std::unordered_map<u64, CompiledPipeline> pipelines;   // GraphicsPipelineKey::Hash() -> main/square VkPipeline (under prog_lock)
-    std::unordered_set<u64> gpl_lto_queued;                // fast-linked GPL pipelines queued for background LTO (under prog_lock)
-    std::vector<VkPipeline> retired_pipelines;             // fast-linked handles replaced by LTO, destroyed on shutdown (under prog_lock)
     // Tier 2 (Gpl): 4-part Graphics Pipeline Library caches (under prog_lock).
     VkPipeline gpl_vi[3]{};                              // Vertex Input Interface: POINT_LIST, LINE_LIST, TRIANGLE_LIST
     std::unordered_map<u64, VkPipeline> gpl_prerast;     // Pre-Rasterization library cache (VS+GS or non-default static flags)
@@ -934,9 +929,9 @@ struct Renderer::Impl {
     VkPipeline GetGplPreRaster(const ShaderRef& vs, const ShaderRef& gs, const FixedPipelineState& state);
     VkPipeline GetGplFragShader(const ShaderRef& ps, const FixedPipelineState& state);
     VkPipeline GetGplFragOutput(const FixedPipelineState& state, bool square_pass);
-    VkPipeline LinkGplPipeline(const VkPipeline (&libs)[4], bool lto, bool fail_on_compile);
-    CompiledPipeline LinkGplPair(const VkPipeline (&main_libs)[4], VkPipeline foi_square, bool lto, bool fail_on_compile);
-    void EnqueueGplLto(u64 h, const VkPipeline (&libs)[4], VkPipeline foi_sq);
+    enum class GplLink { Unoptimized, CachedLto, BuildLto };  // BuildLto is reserved for startup AOT.
+    VkPipeline LinkGplPipeline(const VkPipeline (&libs)[4], GplLink mode);
+    CompiledPipeline LinkGplPair(const VkPipeline (&main_libs)[4], VkPipeline foi_square, GplLink mode);
     CompiledPipeline GetGraphicsPipeline(const ShaderRef& vs, const ShaderRef& ps, const ShaderRef& gs,
                                          const FixedPipelineState& raw_state, const CpuRead& cpu);
     // TEMP pipeline log (debug runs, GOW3_TEMP_PIPELOG=0: off): every distinct draw state (programs, raw state) with its frames
